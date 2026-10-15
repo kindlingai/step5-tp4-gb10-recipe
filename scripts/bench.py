@@ -118,8 +118,30 @@ def stats(values):
     values=[v for v in values if v is not None]
     return {'n':len(values),'median':statistics.median(values),'mean':statistics.mean(values),'min':min(values),'max':max(values)} if values else None
 
+def phase_hardware(phase):
+    """Summarize only the four-node before/after snapshots, not unsampled peaks."""
+    values={'sm_mhz':[], 'power_w':[]}
+    for boundary in ('clock_before','clock_after'):
+        for node in phase.get(boundary,{}).values():
+            if not node.get('verified'):continue
+            for line in node.get('stdout','').splitlines():
+                cells=line.split(',')
+                if len(cells)!=4:continue
+                for key,index in (('sm_mhz',0),('power_w',3)):
+                    match=re.fullmatch(r'\s*([0-9]+(?:\.[0-9]+)?)\s*(?:MHz|W)?\s*',cells[index])
+                    if match:values[key].append(float(match[1]))
+    return {'sampling':'Four nodes, before and after the phase; not continuous telemetry.',
+            'expected_samples':8, **{key:stats(items) for key,items in values.items()}}
+
+def hardware_cell(phase,key):
+    summary=phase_hardware(phase);value=summary[key]
+    count=value['n'] if value else 0
+    if count!=summary['expected_samples']:return f'N/A ({count}/8 samples)'
+    places=0 if key=='sm_mhz' else 1
+    return ' / '.join(f'{value[k]:.{places}f}' for k in ('min','median','max'))
+
 def markdown(receipt):
-    lines=['# Step-5 TP4 first numbers','', '| Phase | Clock | n | TTFT median (s) | Prompt tok/s proxy median | S1 decode tok/s median | MTP accepted/drafted |', '|---|---|---:|---:|---:|---:|---:|']
+    lines=['# Step-5 TP4 first numbers','', '| Phase | Clock label | SM MHz min/med/max | GPU W min/med/max | n | TTFT median (s) | Prompt tok/s proxy median | S1 decode tok/s median | MTP accepted/drafted |', '|---|---|---:|---:|---:|---:|---:|---:|---:|']
     for phase in receipt['phases']:
         if phase.get('kind')=='s4': continue
         runs=[r for r in phase['runs'] if not r['case']['warmup'] and 'result' in r]
@@ -129,12 +151,13 @@ def markdown(receipt):
         pairs=[r['mtp'] for r in runs if r.get('mtp',{}).get('acceptance_fraction') is not None]
         draft=sum(p['draft_tokens'] for p in pairs); accepted=sum(p['accepted_tokens'] for p in pairs)
         rate=f'{100*accepted/draft:.1f}%' if draft else 'N/A'
-        lines.append(f"| {phase['name']} | {phase['clock_label']} | {len(runs)} | {median('ttft_s')} | {median('prompt_tok_s_proxy') if phase['name'].startswith('prefill') else '—'} | {median('decode_tok_s') if phase['name'].startswith('decode') else '—'} | {rate} |")
+        lines.append(f"| {phase['name']} | {phase['clock_label']} | {hardware_cell(phase,'sm_mhz')} | {hardware_cell(phase,'power_w')} | {len(runs)} | {median('ttft_s')} | {median('prompt_tok_s_proxy') if phase['name'].startswith('prefill') else '—'} | {median('decode_tok_s') if phase['name'].startswith('decode') else '—'} | {rate} |")
     lines += ['', 'Prefill uses 1 warmup + 3 measured requests at each size. Decode uses 3 requests per type.',
               'Prompt tok/s is prompt_tokens / client TTFT, not a GPU-only prefill rate.',
               'Decode counts all usage completion tokens, including reasoning. SSE times are approximate token boundaries.',
               'MTP ratios use global server counter deltas. Other traffic invalidates per-request attribution.',
               'fullclk means gpu-clock-cap was inactive on all four ranks before and after the phase; raw clocks are in JSON.',
+              'SM clock and power ranges use eight boundary samples: all four nodes before and after each phase, not continuous telemetry.',
               'These are preliminary three-repeat measurements, not a quality evaluation.']
     warns=[w for p in receipt['phases'] for r in p['runs'] for w in r.get('result',{}).get('warnings',[])]
     if warns: lines += ['','Warnings: '+', '.join(sorted(set(warns)))+'.']
@@ -152,6 +175,8 @@ def run(args, clock_reader=clocks):
              'fixture':fixture,'mode':getattr(args,'mode','s1'),'mtp_config_expected':3,'metrics_settle_s':args.metrics_settle,'phases':[]}
     output=Path(args.output); output.parent.mkdir(parents=True,exist_ok=True)
     def save():
+        for item in receipt['phases']+[receipt[k] for k in ('smoke','soak') if k in receipt]:
+            item['hardware_summary']=phase_hardware(item)
         temp=output.with_suffix('.tmp'); temp.write_text(json.dumps(receipt,indent=2)+'\n'); temp.replace(output)
         output.with_suffix('.md').write_text(markdown(receipt))
     try:
@@ -337,12 +362,12 @@ def extra_markdown(receipt):
     def fmt(value):return '—' if value is None else f'{value:.2f}'
     for phase in receipt.get('phases',[]):
         if phase.get('kind')!='s4':continue
-        lines += ['', '## Decode S4', '', '| Rep | Clock | Aggregate decode tok/s | Per-stream tok/s (0 / 1 / 2 / 3) | Pass |',
-                  '|---:|---|---:|---|---|']
+        lines += ['', '## Decode S4', '', '| Rep | Clock label | SM MHz min/med/max | GPU W min/med/max | Aggregate decode tok/s | Per-stream tok/s (0 / 1 / 2 / 3) | Pass |',
+                  '|---:|---|---:|---:|---:|---|---|']
         for entry in phase['runs']:
             if 'batch' not in entry:continue
             b=entry['batch']
-            lines.append(f"| {entry['rep']} | {phase['clock_label']} | {fmt(b['aggregate_decode_tok_s'])} | {' / '.join(fmt(x) for x in b['per_stream_tok_s'])} | {b['passed']} |")
+            lines.append(f"| {entry['rep']} | {phase['clock_label']} | {hardware_cell(phase,'sm_mhz')} | {hardware_cell(phase,'power_w')} | {fmt(b['aggregate_decode_tok_s'])} | {' / '.join(fmt(x) for x in b['per_stream_tok_s'])} | {b['passed']} |")
         lines += ['', 'Aggregate decode = sum(N − 1) divided by the interval from earliest first text SSE to latest last text SSE.',
                   'Each batch has four concurrent 512-token streams. MTP deltas apply to the whole batch.']
     if 'smoke' in receipt:
