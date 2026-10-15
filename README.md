@@ -75,6 +75,10 @@ scripts/verify-shards.sh 0  # holder 0; use 1 or 2 on the other holders
 
 Use a running kernel NFS server on each holder. This recipe uses standard host NFS tools, not a custom NFS container image. Run the export and mount commands with elevated privileges. The exports are temporary; repeat them after a server restart or configure equivalent persistent exports yourself.
 
+A container can also provide the NFS service through the host kernel's `nfsd`. The alternative deployment uses a privileged container with host networking, a read-only export with `ro,no_root_squash,fsid=0`, and access restricted to the fabric subnet. Clients mount `server:/` with `nfs4` and `ro,nconnect=8,rsize=1048576`.
+
+Both approaches provide the same read-only model-file access. Their export paths and account mapping are not identical: the scripts below export the weights directory by its path and retain the server's default account mapping. The container variant makes the weights directory the NFSv4 export root and disables superuser squashing. Match the mount source and file permissions to the selected server configuration. No container-based NFS setup script is included here.
+
 On each of holders 0, 1, and 2:
 
 ```sh
