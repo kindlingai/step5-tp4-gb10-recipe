@@ -22,7 +22,9 @@ if [[ ${DROP_PAGE_CACHE:-1} == 1 && ! -w /proc/sys/vm/drop_caches ]]; then
 fi
 mkdir -p "$CACHE_DIR"
 HEAD_ARGS=(); [[ $R == 0 ]] || HEAD_ARGS=(--headless)
-RDMA_ARGS=(); [[ -z ${RDMA_HCA:-} ]] || RDMA_ARGS=(-e "NCCL_IB_HCA=$RDMA_HCA")
+# Example HCA names; configure the actual two rails for each node.
+RDMA_HCA=${RDMA_HCA:-mlx5_0,mlx5_1}
+RDMA_ARGS=(-e "NCCL_IB_HCA=$RDMA_HCA")
 SPEC_ARGS=(); if (( ${SPEC_TOKENS:-3} > 0 )); then SPEC_ARGS=(--spec-method mtp --spec-tokens "${SPEC_TOKENS:-3}"); fi
 docker run -d --name "$NAME" --gpus all --ipc=host --network=host --shm-size 16g \
   --ulimit memlock=-1 --device /dev/infiniband \
@@ -31,11 +33,13 @@ docker run -d --name "$NAME" --gpus all --ipc=host --network=host --shm-size 16g
   -e HOME=/cache -e XDG_CACHE_HOME=/cache -e HF_HOME=/cache/huggingface \
   -e "NCCL_SOCKET_IFNAME=$NETWORK_IFACE" -e "GLOO_SOCKET_IFNAME=$NETWORK_IFACE" \
   -e "VLLM_HOST_IP=${NODES[$R]}" "${RDMA_ARGS[@]}" \
+  -e "NCCL_CROSS_NIC=${NCCL_CROSS_NIC:-1}" \
+  -e "NCCL_MIN_NCHANNELS=${NCCL_MIN_NCHANNELS:-2}" -e "NCCL_MAX_NCHANNELS=${NCCL_MAX_NCHANNELS:-2}" \
   --entrypoint vllm "$IMAGE" serve "$MODEL_DIR" "${HEAD_ARGS[@]}" \
   --served-model-name step5 --host 0.0.0.0 --port "${API_PORT:-18000}" \
   --tensor-parallel-size 4 --nnodes 4 --node-rank "$R" --master-addr "$NODE0" --master-port "${MASTER_PORT:-29511}" \
   --distributed-executor-backend mp --disable-custom-all-reduce \
-  --max-model-len "${MAXLEN:-131072}" --max-num-batched-tokens "${BATCH_TOKENS:-4096}" --max-num-seqs "${MAXSEQ:-8}" \
+  --max-model-len "${MAXLEN:-196608}" --max-num-batched-tokens "${BATCH_TOKENS:-4096}" --max-num-seqs "${MAXSEQ:-8}" \
   --gpu-memory-utilization "${GMU:-0.85}" --enable-prefix-caching --kv-cache-dtype "${KV_DTYPE:-auto}" \
   --trust-remote-code "${SPEC_ARGS[@]}" \
   --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5 "${DENSE_ARGS[@]}" "${LM_ARGS[@]}" "$@"

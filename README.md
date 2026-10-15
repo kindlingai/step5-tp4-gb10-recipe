@@ -2,7 +2,7 @@
 
 A recipe skeleton for `stepfun-ai/Step-5-Preview-NVFP4` with vLLM tensor parallelism across four NVIDIA DGX Spark systems (GB10).
 
-**Configuration:** dense attention (DSA kernels need SM90/SM103 in this vLLM image), BF16 KV via `auto`, text-only, MTP3, 131072-token context (65536-token alternative).
+**Configuration:** dense attention (DSA kernels need SM90/SM103 in this vLLM image), BF16 KV via `auto`, text-only, MTP3, 196608-token (192K) context, dual-rail NCCL with two channels. Historical 128K and 64K results remain below.
 
 **Status:** The configuration below has measured benchmark and API-soak results on four systems. The generalized launch and NFS scripts are CPU-tested; those generalized scripts have not been validated end to end on a live cluster.
 
@@ -112,7 +112,7 @@ Default vLLM configuration:
 ```text
 --tensor-parallel-size 4 --nnodes 4
 --distributed-executor-backend mp --disable-custom-all-reduce
---max-model-len 131072 --max-num-batched-tokens 4096 --max-num-seqs 8
+--max-model-len 196608 --max-num-batched-tokens 4096 --max-num-seqs 8
 --gpu-memory-utilization 0.85
 --enable-prefix-caching --kv-cache-dtype auto
 --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5
@@ -121,7 +121,18 @@ Default vLLM configuration:
 --hf-overrides '{"text_config":{"sparse_config":{"enabled":false}}}'
 ```
 
-Rank 0 serves the OpenAI-compatible API on port 18000. Other ranks use `--headless`. The master address is `NODE0`; the default master port is 29511. The launcher sets `VLLM_HOST_IP`, `NCCL_SOCKET_IFNAME`, and `GLOO_SOCKET_IFNAME`. Set `RDMA_HCA` when NCCL needs an explicit HCA selection.
+Rank 0 serves the OpenAI-compatible API on port 18000. Other ranks use `--headless`. The master address is `NODE0`; the default master port is 29511. The launcher sets `VLLM_HOST_IP`, `NCCL_SOCKET_IFNAME`, and `GLOO_SOCKET_IFNAME`. The default C2 profile selects both fabric rails through `NCCL_IB_HCA`, with `NCCL_CROSS_NIC=1`, `NCCL_MIN_NCHANNELS=2`, and `NCCL_MAX_NCHANNELS=2`.
+
+Set `RDMA_HCA` to a comma-separated pair of actual HCA names for the two rails on each node. The `mlx5_0,mlx5_1` names in the example and fallback are documentation examples, not hardware discovery. Both rails must have working peer connectivity. The socket interface remains separately configured by `NETWORK_IFACE`. These settings come from the measured b4 C2 profile; no host-specific interface names or addresses are needed to describe the rails.
+
+```sh
+RDMA_HCA=mlx5_0,mlx5_1  # replace with this node's two fabric HCAs
+NCCL_CROSS_NIC=1
+NCCL_MIN_NCHANNELS=2
+NCCL_MAX_NCHANNELS=2
+```
+
+The launcher passes `RDMA_HCA` as `NCCL_IB_HCA`. Each NCCL setting can be overridden in the configuration for a separately measured profile.
 
 ### Attention and KV compatibility
 
@@ -141,7 +152,7 @@ For comparison, the separate [0xSero four-Spark recipe README](https://github.co
 
 `SPEC_TOKENS=3` is the default. Set `SPEC_TOKENS=0` to omit speculative arguments for a separate non-MTP configuration. Extra vLLM arguments may follow the rank. No optional MoE overlay is included in this baseline.
 
-The launcher refuses to replace an existing container with the same name. Inspect logs and stop/remove old containers explicitly before another launch. Verify image identity, model readiness, memory allocation, and the actual KV-cache token pool before recording results. This configuration requests `--kv-cache-dtype auto`, which uses BF16 KV for this model. The 128K profile reported a KV pool of 202,818 tokens (4.23 GiB observed on rank 0); the 64K profile reported 156,294 tokens (4.71 GiB per rank). Set `MAXLEN=65536` in your configuration for the 64K alternative; the default is `MAXLEN=131072`. Verify capacity again after any configuration change.
+The launcher refuses to replace an existing container with the same name. Inspect logs and stop/remove old containers explicitly before another launch. Verify image identity, model readiness, memory allocation, and the actual KV-cache token pool before recording results. This configuration requests `--kv-cache-dtype auto`, which uses BF16 KV for this model. The default 192K profile reported a KV pool of 258,523 tokens (1.31× capacity at 196608 tokens; allocation GiB not recorded here). Historical 128K reported 202,818 tokens (4.23 GiB observed on rank 0); 64K reported 156,294 tokens (4.71 GiB per rank). The launch default is `MAXLEN=196608`. Set `MAXLEN=131072` or `65536` to request a smaller window, but changing context alone does not reproduce the historical single-rail configurations. Verify capacity again after any configuration change.
 
 ### Boot-time page-cache workaround
 
@@ -231,9 +242,43 @@ Every soak request produces a JSONL record in `<output-stem>.requests.jsonl`, wi
 
 All modes retain the explicit `--go` gate. Smoke, S4, and soak failures return a nonzero CLI status. `complete` records whether the mode finished; `passed` records its outcome. Unit tests use short local stub soaks, not a ten-minute live run.
 
-## Measured results: two profiles
+## Measured results: current profile and history
 
-### b2 — 64K context, MTP3, fullclk
+### b4 — 192K context, MTP3, clk2000, dual-rail C2 (default)
+
+Measured on 2026-10-15, run `b4-20261015T223410Z`, with an exclusive server window.
+The API listing confirms a 196608-token configured context. The reported KV pool is
+258,523 tokens, or 1.31× at that length. This ratio is a capacity estimate, not a
+measured concurrent-long-request result. The reported C2 profile uses both HCAs,
+`NCCL_CROSS_NIC=1`, and two channels. The benchmark client did not independently
+inspect the NCCL environment.
+
+Smoke and all 29 benchmark requests passed with matching token counts and no client
+warnings. The 4 GiB memory guard did not abort. Minimum host MemAvailable was
+9.5595 GiB; maximum sampled GPU temperature was 56 C. All phase samplers stopped
+cleanly. Every cap service was active before and after each phase; `clk2000`
+records the externally reported target, not an independent configured-cap reading.
+
+| Phase | Clock label | Sample source | SM MHz min/med/max | GPU W min/med/max | TTFT median (s) | Prefill proxy (tok/s) | Decode (tok/s) | MTP accepted/drafted |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| 8K prefill | clk2000 | in-phase 1s | 1969 / 1982 / 1995 | 8.8 / 26.0 / 27.8 | 6.18 | 1324.84 | — | N/A |
+| 32K prefill | clk2000 | in-phase 1s | 1969 / 1989 / 1995 | 8.4 / 29.0 / 32.0 | 26.49 | 1236.88 | — | N/A |
+| S1 prose, 512 output | clk2000 | in-phase 1s | 1976 / 1982 / 1995 | 7.9 / 18.2 / 18.9 | 0.64 | — | 27.95 | 974 / 1683 (57.9%) |
+| S1 code, 512 output | clk2000 | in-phase 1s | 1969 / 1976 / 1995 | 7.9 / 18.3 / 19.8 | 0.34 | — | 28.61 | 980 / 1668 (58.8%) |
+| S1 JSON, 512 output | clk2000 | in-phase 1s | 1969 / 1982 / 1989 | 8.8 / 18.2 / 19.5 | 0.33 | — | 27.07 | 978 / 1677 (58.3%) |
+| S4, four × 512 output | clk2000 | in-phase 1s | 1969 / 1982 / 1995 | 8.2 / 21.7 / 24.5 | — | — | 60.09 aggregate; 16.06 per stream | 3864 / 6840 (56.5%) |
+
+**Observed prefill improvement versus the single-rail b3 run: approximately +15–16%**
+(+16.1% at 8K and +15.3% at 32K). Both profiles use clk2000 and
+MTP3. Context/KV capacity and boot also changed, so this is a comparison of the
+measured profiles, not an isolated proof that dual rails alone caused the gain.
+
+S4 aggregate rates were 60.09, 62.29, and 60.09 tok/s; the per-stream figure pools
+all 12 streams. Rates and TTFT use three-repeat medians. No b4 soak was run.
+The benchmark's largest input is 32768 tokens; these results do not prove 192K
+recall or quality. The separate 190K needle result is pending and is not included.
+
+### b2 — 64K context, MTP3, fullclk (history)
 
 Measured on 2026-10-15 with the pinned model above, four GB10 systems, dense attention, BF16 KV, memory utilization 0.85, and a 4096-token batch limit. All benchmark requests passed without client warnings or memory-guard aborts. This b2 profile used 65536 context and a 156,294-token KV pool. Its benchmark run was `b2-20261015T201632Z`. The resolved image digest and exact fabric hardware are not included in this result summary.
 
@@ -261,7 +306,7 @@ The API stability run requested 600 seconds and finished its last batch at 614.1
 The cap service was inactive on all four nodes before the soak and active on all four afterward. Therefore, this is **not a fullclk soak**. All four samplers stopped cleanly, with 613 in-request samples per rank. The reused prompt pool allowed prefix-cache hits. PASS covers client/API stability, not model quality or the absence of kernel/driver errors.
 
 
-### b3 — 128K context, MTP3, clk2000 (default)
+### b3 — 128K context, MTP3, clk2000 (single-rail history)
 
 Measured on 2026-10-15, run `b3-20261015T205109Z`. The configured context is 131072; the reported KV pool is 202,818 tokens, with 4.23 GiB observed on rank 0. Other settings match b2: dense attention, BF16 KV, MTP3, memory utilization 0.85, batch limit 4096, and language-model-only.
 
