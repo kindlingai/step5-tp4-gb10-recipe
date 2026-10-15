@@ -18,7 +18,7 @@ LM_ARGS=(); [[ ${LMONLY:-1} != 1 ]] || LM_ARGS=(--language-model-only)
 mkdir -p "$CACHE_DIR"
 HEAD_ARGS=(); [[ $R == 0 ]] || HEAD_ARGS=(--headless)
 RDMA_ARGS=(); [[ -z ${RDMA_HCA:-} ]] || RDMA_ARGS=(-e "NCCL_IB_HCA=$RDMA_HCA")
-SPEC_ARGS=(); if (( ${SPEC_TOKENS:-3} > 0 )); then SPEC_ARGS=(--spec-method mtp --spec-tokens "${SPEC_TOKENS:-3}"); fi
+SPEC_ARGS=(); if (( ${SPEC_TOKENS:-0} > 0 )); then SPEC_ARGS=(--spec-method mtp --spec-tokens "${SPEC_TOKENS:-0}"); fi
 docker run -d --name "$NAME" --gpus all --ipc=host --network=host --shm-size 16g \
   --ulimit memlock=-1 --device /dev/infiniband \
   --mount "type=bind,source=$STEP5_ROOT,target=$STEP5_ROOT,readonly" \
@@ -31,7 +31,7 @@ docker run -d --name "$NAME" --gpus all --ipc=host --network=host --shm-size 16g
   --tensor-parallel-size 4 --nnodes 4 --node-rank "$R" --master-addr "$NODE0" --master-port "${MASTER_PORT:-29511}" \
   --distributed-executor-backend mp --disable-custom-all-reduce \
   --max-model-len "${MAXLEN:-65536}" --max-num-batched-tokens "${BATCH_TOKENS:-4096}" --max-num-seqs "${MAXSEQ:-8}" \
-  --gpu-memory-utilization "${GMU:-0.82}" --enable-prefix-caching --kv-cache-dtype "${KV_DTYPE:-auto}" \
+  --gpu-memory-utilization "${GMU:-0.85}" --enable-prefix-caching --kv-cache-dtype "${KV_DTYPE:-auto}" \
   --trust-remote-code "${SPEC_ARGS[@]}" \
   --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5 "${DENSE_ARGS[@]}" "${LM_ARGS[@]}" "$@"
 printf 'Started %s at rank %s\n' "$NAME" "$R"

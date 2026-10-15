@@ -2,7 +2,7 @@
 
 A recipe skeleton for `stepfun-ai/Step-5-Preview-NVFP4` with vLLM tensor parallelism across four NVIDIA DGX Spark systems (GB10).
 
-**Configuration:** dense attention (DSA kernels need SM90/SM103 in this vLLM image), BF16 KV via `auto`, text-only, MTP3.
+**Configuration:** dense attention (DSA kernels need SM90/SM103 in this vLLM image), BF16 KV via `auto`, text-only, MTP disabled.
 
 **Status:** CPU-tested recipe draft. The generalized launch and NFS scripts have not been validated on a live cluster. No performance result is claimed below.
 
@@ -113,9 +113,8 @@ Default vLLM configuration:
 --tensor-parallel-size 4 --nnodes 4
 --distributed-executor-backend mp --disable-custom-all-reduce
 --max-model-len 65536 --max-num-batched-tokens 4096 --max-num-seqs 8
---gpu-memory-utilization 0.82
+--gpu-memory-utilization 0.85
 --enable-prefix-caching --kv-cache-dtype auto
---spec-method mtp --spec-tokens 3
 --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5
 --trust-remote-code --language-model-only
 --hf-overrides '{"text_config":{"sparse_config":{"enabled":false}}}'
@@ -137,9 +136,9 @@ The FA2 path on SM121 in this image does not support FP8 KV. Therefore, `KV_DTYP
 
 For comparison, the separate [0xSero four-Spark recipe README](https://github.com/0xSero/Step-5-Preview-Four-Sparks/blob/main/README.md#configuration), checked on 2026-10-15, specifies **FP16 KV** matching its FP16 model dtype. It is not an FP8-KV recipe. Its configuration is different; no performance or quality equivalence is implied.
 
-`LMONLY=1` enables `--language-model-only` by default, so this recipe serves text and does not load the vision encoder. The current defaults are memory utilization 0.82, a 4096-token batch limit, and three MTP draft tokens. The environment example and launcher use the same defaults.
+`LMONLY=1` enables `--language-model-only` by default, so this recipe serves text and does not load the vision encoder. The current defaults are memory utilization 0.85, a 4096-token batch limit, and no MTP draft tokens. The environment example and launcher use the same defaults.
 
-`SPEC_TOKENS=0` disables the speculative arguments. Extra vLLM arguments may follow the rank. No optional MoE overlay is included in this baseline.
+`SPEC_TOKENS=0` is the default and omits all speculative arguments. MTP is disabled for this configuration; MTP acceptance is therefore N/A. An explicit positive `SPEC_TOKENS` value enables MTP for a separate configuration. Extra vLLM arguments may follow the rank. No optional MoE overlay is included in this baseline.
 
 The launcher refuses to replace an existing container with the same name. Inspect logs and stop/remove old containers explicitly before another launch. Verify image identity, model readiness, memory allocation, and the actual KV-cache token pool before recording results. This configuration requests `--kv-cache-dtype auto`, which uses BF16 KV for this model. Its actual KV capacity is not yet verified by this draft.
 
@@ -169,7 +168,7 @@ Copy only `scripts/bench.py` and the generated `scripts/prompts.json` to the cli
 export BENCH_HOSTS=192.168.50.11,192.168.50.12,192.168.50.13,192.168.50.14
 export SSH_USER=  # leave empty to use the SSH default, or set your account
 export CLIENT_LABEL=client
-python3 scripts/bench.py --go \
+python3 scripts/bench.py --go --mtp-tokens 0 \
   --base http://192.168.50.11:18000/v1 --output receipt.json
 ```
 
