@@ -275,8 +275,28 @@ measured profiles, not an isolated proof that dual rails alone caused the gain.
 
 S4 aggregate rates were 60.09, 62.29, and 60.09 tok/s; the per-stream figure pools
 all 12 streams. Rates and TTFT use three-repeat medians. No b4 soak was run.
-The benchmark's largest input is 32768 tokens; these results do not prove 192K
-recall or quality. The separate 190K needle result is pending and is not included.
+The benchmark's largest input is 32768 tokens. The separate long-context recall
+check below covers one 190,000-token prompt; it is not a general quality test.
+
+#### b4 190K needle recall: PASS
+
+| Check | Result | Clock label | GPU power |
+|---|---|---|---|
+| Single long-context needle recall | PASS: exact inserted answer; 190,000 input tokens; 239 s end-to-end wall time | clk2000 (reported for the b4 boot) | Not recorded for this request |
+
+The native tokenizer counted exactly **190,000 input tokens**, including the chat
+template. The request used `max_tokens=256` and `temperature=0`. The streamed
+answer matched the inserted text exactly and ended normally. This used the b4
+profile: 196608-token window, MTP3, BF16 KV, dense attention, dual-rail C2, clk2000.
+
+Dividing input tokens by the whole-request wall time gives approximately
+**795 input tok/s**. This includes long-context prefill and answer generation;
+it is not a TTFT-based prefill rate, a kernel-only rate, or a decode rate.
+The recorded start/end times have one-second resolution.
+
+PASS establishes exact recall for this one synthetic needle, not general
+long-context quality or the full 196608-token limit. No secret, raw prompt,
+host information, or operational receipt is included here.
 
 ### b2 — 64K context, MTP3, fullclk (history)
 
