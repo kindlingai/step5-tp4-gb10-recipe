@@ -68,9 +68,11 @@ def clocks():
         except Exception as e: return name,{'utc':start,'host':host,'verified':False,'error':repr(e)}
     with ThreadPoolExecutor(max_workers=4) as ex: return dict(ex.map(one,NODES.items()))
 
-def clock_label(before,after):
+def clock_label(before,after,requested="auto"):
     snapshots=[s for snap in (before,after) for s in snap.values()]
     if len(snapshots)!=8 or not all(s.get('verified') for s in snapshots): return 'unknown'
+    if requested=='clk2000':
+        return 'clk2000' if all(s['cap_state']=='active' for s in snapshots) else 'clock-policy-mismatch'
     if all(s['cap_state']=='inactive' for s in snapshots): return 'fullclk'
     return 'cap-active-or-mixed'
 
@@ -290,7 +292,7 @@ def run(args, clock_reader=clocks, sampler_factory=PhaseSampler):
              'endpoint':base,'model':fixture['model'],'tokenizer_revision':fixture['tokenizer_revision'],
              'tokenizer_sha256':fixture['tokenizer_sha256'],'script_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
              'fixture_sha256':hashlib.sha256(Path(args.prompts).read_bytes()).hexdigest(),
-             'fixture':fixture,'mode':getattr(args,'mode','s1'),'mtp_config_expected':getattr(args,'mtp_tokens',3),'metrics_settle_s':args.metrics_settle,'phases':[]}
+             'clock_policy_requested':getattr(args,'clock_label','auto'),'fixture':fixture,'mode':getattr(args,'mode','s1'),'mtp_config_expected':getattr(args,'mtp_tokens',3),'metrics_settle_s':args.metrics_settle,'phases':[]}
     output=Path(args.output); output.parent.mkdir(parents=True,exist_ok=True)
     active_samplers=[]
     def begin_sampling(item):
@@ -332,7 +334,7 @@ def run(args, clock_reader=clocks, sampler_factory=PhaseSampler):
             finally:
                 phase['telemetry']=sampler.stop()
                 phase['clock_after']=clock_reader()
-                phase['clock_label']=clock_label(phase['clock_before'],phase['clock_after'])
+                phase['clock_label']=clock_label(phase['clock_before'],phase['clock_after'],getattr(args,'clock_label','auto'))
                 phase['summary']={k:stats([r['result'][k] for r in phase['runs'] if 'result' in r and not r['case']['warmup']]) for k in ('ttft_s','prompt_tok_s_proxy','decode_tok_s')}
                 save()
         if mode in ('bench','s4'): run_s4(args,fixture,receipt,save,clock_reader,begin_sampling)
@@ -416,7 +418,7 @@ def run_s4(args, fixture, receipt, save, clock_reader, begin_sampling):
             save()
     finally:
         phase['telemetry']=sampler.stop()
-        phase['clock_after']=clock_reader();phase['clock_label']=clock_label(phase['clock_before'],phase['clock_after'])
+        phase['clock_after']=clock_reader();phase['clock_label']=clock_label(phase['clock_before'],phase['clock_after'],getattr(args,'clock_label','auto'))
         phase['summary']={'aggregate_decode_tok_s':stats([r['batch']['aggregate_decode_tok_s'] for r in phase['runs'] if 'batch' in r]),
                           'per_stream_tok_s':stats([v for r in phase['runs'] if 'batch' in r for v in r['batch']['per_stream_tok_s']])}
         save()
@@ -446,7 +448,7 @@ def run_smoke(args, fixture, receipt, save, clock_reader, begin_sampling):
         receipt['passed']=data['passed']
     finally:
         data['telemetry']=sampler.stop()
-        data['clock_after']=clock_reader();data['clock_label']=clock_label(data['clock_before'],data['clock_after']);save()
+        data['clock_after']=clock_reader();data['clock_label']=clock_label(data['clock_before'],data['clock_after'],getattr(args,'clock_label','auto'));save()
 
 def run_soak(args, fixture, receipt, save, clock_reader, begin_sampling):
     duration=getattr(args,'soak_seconds',600)
@@ -487,7 +489,7 @@ def run_soak(args, fixture, receipt, save, clock_reader, begin_sampling):
         data['passed']=not data['errors'] and data['coverage_complete'] and data['duration_s']>=duration
         data['scope']='Client/API stability only; this mode does not inspect kernel logs or establish absence of GPU driver errors.'
         receipt['passed']=data['passed']
-        data['clock_after']=clock_reader();data['clock_label']=clock_label(data['clock_before'],data['clock_after']);save()
+        data['clock_after']=clock_reader();data['clock_label']=clock_label(data['clock_before'],data['clock_after'],getattr(args,'clock_label','auto'));save()
 
 def extra_markdown(receipt):
     lines=[]
@@ -517,6 +519,7 @@ def extra_markdown(receipt):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser()
+    p.add_argument('--clock-label',choices=('auto','clk2000'),default='auto',help='Reported target only; clk2000 also requires active cap at both boundaries')
     p.add_argument('--mtp-tokens',type=int,default=3,help='Expected server MTP count; metadata only')
     p.add_argument('--mode',choices=('bench','s1','s4','smoke','soak'),default='bench')
     p.add_argument('--soak-seconds',type=float,default=600)

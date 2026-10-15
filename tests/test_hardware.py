@@ -14,6 +14,15 @@ class HardwareTests(unittest.TestCase):
             return {f'rank{i}':{'verified':True,'stdout':f'SM [MHz], Max SM [MHz], Temp [C], Power [W]\n{1800+100*i+offset} MHz, 3000 MHz, 45, {50+10*i+offset/10:.2f} W\ninactive\nGPU_RC=0 CAP_RC=3\n'} for i in range(4)}
         return {'name':'decode_s4','kind':'s4','clock_label':'fullclk',
                 'clock_before':snapshot(0),'clock_after':snapshot(100),'runs':[]}
+    def test_clock_target_requires_active_cap(self):
+        active={f'rank{i}':{'verified':True,'cap_state':'active'} for i in range(4)}
+        inactive={f'rank{i}':{'verified':True,'cap_state':'inactive'} for i in range(4)}
+        self.assertEqual(bench.clock_label(active,active,'clk2000'),'clk2000')
+        self.assertEqual(bench.clock_label(inactive,inactive,'clk2000'),'clock-policy-mismatch')
+        self.assertEqual(bench.clock_label(active,inactive,'clk2000'),'clock-policy-mismatch')
+        self.assertEqual(bench.clock_label(inactive,inactive),'fullclk')
+        self.assertEqual(bench.clock_label(active,active),'cap-active-or-mixed')
+        self.assertEqual(bench.clock_label(active,{},'clk2000'),'unknown')
     def test_min_median_max(self):
         phase=self.phase();summary=bench.phase_hardware(phase)
         self.assertEqual(summary['sm_mhz']['n'],8)
