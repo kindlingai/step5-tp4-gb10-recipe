@@ -1,0 +1,12 @@
+.gitattributes
+LICENSE-CN.txt
+LICENSE.txt
+README.md
+SHA256SUMS
+chat_template.jinja
+config.json
+hf_quant_config.json
+model.safetensors.index.json
+special_tokens_map.json
+tokenizer.json
+tokenizer_config.json

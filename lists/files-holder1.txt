@@ -1,0 +1,17 @@
+model-layer-004.safetensors
+model-layer-012.safetensors
+model-layer-018.safetensors
+model-layer-025.safetensors
+model-layer-033.safetensors
+model-layer-039.safetensors
+model-layer-040.safetensors
+model-layer-046.safetensors
+model-layer-053.safetensors
+model-layer-061.safetensors
+model-layer-063.safetensors
+model-layer-066.safetensors
+model-layer-073.safetensors
+model-layer-080.safetensors
+model-layer-083.safetensors
+model-layer-089.safetensors
+model-vit-000.safetensors

@@ -1,0 +1,7 @@
+config.env
+__pycache__/
+*.pyc
+scripts/tokenizer/
+scripts/prompts.json
+receipt*.json
+receipt*.md

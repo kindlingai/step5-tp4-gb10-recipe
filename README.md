@@ -1,0 +1,190 @@
+# Step-5 Preview NVFP4 on four DGX Spark systems
+
+A recipe skeleton for `stepfun-ai/Step-5-Preview-NVFP4` with vLLM tensor parallelism across four NVIDIA DGX Spark systems (GB10).
+
+**Status:** CPU-tested recipe draft. The generalized launch and NFS scripts have not been validated on a live cluster. No performance result is claimed below.
+
+## Hardware and software
+
+- Four DGX Spark systems with GB10 GPUs, working GPU drivers, Docker, and NVIDIA Container Toolkit.
+- A working inter-node RDMA network. Set the network interface and HCA for your installation.
+- Local NVMe capacity on three nodes for the split weights, plus container images, caches, and operating-system headroom.
+- NFS client utilities on all compute nodes, a kernel NFS server on the three storage holders, SSH, rsync, and Python 3.
+- Image: `vllm/vllm-openai:step-5-preview`. This tag can change; record its resolved digest before a measured run.
+- Model revision: **`bc246cc2`**, full pin `bc246cc2848e17b37f377eda8fd825c5b3018d1f`.
+
+The scripts do not install system packages or change GPU clocks. Complete those prerequisites before use. Run only on machines allocated to this experiment.
+
+## Storage: three holders, four compute ranks
+
+The split controls disk placement, not tensor-parallel ownership. Each compute rank sees the complete model through a symlink directory. Local files use local NVMe; other files use read-only NFS mounts.
+
+| Compute rank | Storage role | Weight files | Weight bytes (decimal GB) |
+|---|---|---:|---:|
+| 0 | Holder 0, plus configuration/tokenizer files | 21 | 93.58 |
+| 1 | Holder 1 | 17 | 77.50 |
+| 2 | Holder 2 | 57 | 223.09 |
+| 3 | No local weight files | 0 | 0 |
+
+The lists contain 95 weight files and 12 metadata files. Keep the pinned file lists unchanged. The uneven split is intentional. All ranks need network access to all three holders during model load; NFS is not a remote GPU-memory extension.
+
+Default layout (replace these paths if required):
+
+```text
+/srv/step5/weights        local subset on holders 0–2
+/srv/step5/nfs/holder0    remote holder 0, except on its own node
+/srv/step5/nfs/holder1    remote holder 1, except on its own node
+/srv/step5/nfs/holder2    remote holder 2, except on its own node
+/srv/step5/model          complete symlink view
+/var/cache/step5          writable container cache
+```
+
+The whole storage tree is bound into each container at the same absolute path, read-only. This preserves symlink targets. A separate writable cache is mounted at `/cache`.
+
+## Configure and copy weights
+
+All addresses in `env.example` are documentation placeholders. Set addresses, interface, HCA, storage paths, and SSH account for your cluster. Use the same storage paths on all nodes.
+
+```sh
+cp env.example config.env
+# Edit config.env before continuing.
+export STEP5_CONFIG="$PWD/config.env"
+```
+
+Download the complete pinned model on a staging machine with enough space. For example, with the Hugging Face CLI already installed:
+
+```sh
+hf download stepfun-ai/Step-5-Preview-NVFP4 \
+  --revision bc246cc2848e17b37f377eda8fd825c5b3018d1f \
+  --local-dir /mnt/model-source
+```
+
+Copy this recipe and your private configuration to each compute node. Keep `config.env` out of version control. On the staging machine, set `SOURCE_DIR` to the completed download, then copy each subset:
+
+```sh
+scripts/copy-shards.sh
+```
+
+The script uses `rsync -aS`. It copies the 12 metadata files to holder 0 and the upstream checksum manifest to every holder. It never deletes existing files. On each holder, verify its local weight files against the upstream manifest:
+
+```sh
+scripts/verify-shards.sh 0  # holder 0; use 1 or 2 on the other holders
+```
+
+## Read-only NFS and model view
+
+Use a running kernel NFS server on each holder. This recipe uses standard host NFS tools, not a custom NFS container image. Run the export and mount commands with elevated privileges. The exports are temporary; repeat them after a server restart or configure equivalent persistent exports yourself.
+
+On each of holders 0, 1, and 2:
+
+```sh
+scripts/export-nfs.sh
+```
+
+On each compute node, use its own rank:
+
+```sh
+scripts/mount-nfs.sh 0  # use 1, 2, or 3 on the other nodes
+scripts/mklinks.sh 0
+```
+
+Mounts use NFSv4 with `ro,nconnect=8`. Check existing mounts with `findmnt` before reuse. Keep model files readable by the NFS clients. The symlink builder fails on missing files. It does not remove the model directory.
+
+## Multi-node launch
+
+The default launcher uses the multiprocessing executor, not Ray. Start ranks 1, 2, and 3 on their respective nodes, then rank 0. Use the same image and configuration on every rank.
+
+```sh
+scripts/launch.sh 1  # on rank 1
+scripts/launch.sh 2  # on rank 2
+scripts/launch.sh 3  # on rank 3
+scripts/launch.sh 0  # on rank 0
+```
+
+Default vLLM configuration:
+
+```text
+--tensor-parallel-size 4 --nnodes 4
+--distributed-executor-backend mp --disable-custom-all-reduce
+--max-model-len 65536 --max-num-batched-tokens 16384 --max-num-seqs 8
+--gpu-memory-utilization 0.87
+--enable-prefix-caching --kv-cache-dtype fp8
+--spec-method mtp --spec-tokens 3
+--reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5
+--trust-remote-code
+```
+
+Rank 0 serves the OpenAI-compatible API on port 18000. Other ranks use `--headless`. The master address is `NODE0`; the default master port is 29511. The launcher sets `VLLM_HOST_IP`, `NCCL_SOCKET_IFNAME`, and `GLOO_SOCKET_IFNAME`. Set `RDMA_HCA` when NCCL needs an explicit HCA selection.
+
+`SPEC_TOKENS=0` disables the speculative arguments. Extra vLLM arguments may follow the rank. No optional MoE overlay is included in this baseline.
+
+The launcher refuses to replace an existing container with the same name. Inspect logs and stop/remove old containers explicitly before another launch. Verify image identity, model readiness, memory allocation, and the actual KV-cache token pool before recording results. FP8 KV is requested; its capacity and sliding-window behavior are not yet verified by this draft.
+
+This configuration exposes the API on the host network without authentication. Use a trusted isolated network or add an appropriate authenticated front end. Do not expose it directly to the internet.
+
+## Smoke test and benchmark
+
+After the API reports readiness, use your configured rank-0 address:
+
+```sh
+curl -f http://192.168.50.11:18000/v1/models
+curl -f http://192.168.50.11:18000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"step5","messages":[{"role":"user","content":"Reply with a short greeting."}],"max_tokens":64,"temperature":0}'
+```
+
+Prepare benchmark prompts on a CPU machine with `transformers` and `tokenizers` installed:
+
+```sh
+scripts/fetch-tokenizer.sh
+CUDA_VISIBLE_DEVICES='' python3 scripts/prepare.py
+```
+
+Copy only `scripts/bench.py` and the generated `scripts/prompts.json` to the client machine. The client needs only Python's standard library. It must have SSH access to all four ranks for read-only clock checks.
+
+```sh
+export BENCH_HOSTS=192.168.50.11,192.168.50.12,192.168.50.13,192.168.50.14
+export SSH_USER=  # leave empty to use the SSH default, or set your account
+export CLIENT_LABEL=client
+python3 scripts/bench.py --go \
+  --base http://192.168.50.11:18000/v1 --output receipt.json
+```
+
+The harness uses one warmup plus three measured requests at each prefill size, then three 512-token decode requests for each of prose, code, and JSON. Each request has a different prefix. Regenerate the prompts before a repeated run to avoid prefix-cache reuse. Decode uses `ignore_eos=true` to request the full length.
+
+- Input sizes are exactly 8192 and 32768 tokens after the pinned chat template. The receipt compares server usage with the local counts.
+- TTFT runs from request start to first nonempty content or reasoning SSE text.
+- Prefill throughput is `prompt_tokens / client TTFT`, not a GPU-only kernel rate.
+- Decode throughput is `(usage.completion_tokens - 1) / (last - first text SSE timestamp)`. Usage includes reasoning tokens. SSE chunks can contain several tokens; this is a stream-boundary estimate.
+- Per-run MTP acceptance uses accepted/drafted counter deltas from `/metrics`. No other request traffic may occur during these measurements. The default 11-second post-request metrics wait must exceed the server's actual publication interval.
+- Before and after each phase, the harness records current/max SM clocks, temperature, power, and `gpu-clock-cap` service state on all four ranks. `fullclk` requires the service to be inactive on all four at both boundaries. Failed queries produce `unknown`. This label does not claim every sampled clock reaches the hardware maximum.
+- JSON receipts contain operational addresses, clock command output, and raw metrics. Review and redact them before sharing. The privacy scanner is an automated check, not a complete privacy review.
+
+## Results — placeholders only
+
+| Phase | Clock label | Measured repeats | TTFT median (s) | Prefill proxy (tok/s) | S1 decode (tok/s) | MTP acceptance |
+|---|---|---:|---:|---:|---:|---:|
+| 8K prefill | pending | — | — | — | — | — |
+| 32K prefill | pending | — | — | — | — | — |
+| Prose, 512 output | pending | — | — | — | — | — |
+| Code, 512 output | pending | — | — | — | — | — |
+| JSON, 512 output | pending | — | — | — | — | — |
+
+Record the resolved image digest, complete model revision, measured clock samples, KV-cache pool, run date, and hardware/network configuration alongside any future results. Do not compare rows with different clock settings without stating the difference.
+
+## Local validation and privacy check
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 tests/test_recipe.py
+for script in scripts/*.sh; do bash -n "$script"; done
+scripts/privacy_scan.sh
+```
+
+The tests use temporary files and a mock container command. They do not contact a cluster. The scan checks working-tree text, relative filenames, and available commit history for private infrastructure details and common credential formats. It includes its own script. Keep local credentials and generated receipts out of a release bundle.
+
+## Credits and licenses
+
+- [StepFun model and model card](https://huggingface.co/stepfun-ai/Step-5-Preview-NVFP4): model, tokenizer, and model documentation. The deployment image supplied for this model is `vllm/vllm-openai:step-5-preview`.
+- [vLLM documentation](https://docs.vllm.ai/): inference engine, distributed execution, OpenAI-compatible API, and speculative-decoding metrics.
+
+The recipe scripts use the MIT license in `LICENSE`. The model, image, and their dependencies retain their own licenses. Review the pinned model's license files before use.
