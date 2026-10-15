@@ -161,9 +161,21 @@ The default `bench` mode uses one warmup plus three measured requests at each pr
 - Prefill throughput is `prompt_tokens / client TTFT`, not a GPU-only kernel rate.
 - Decode throughput is `(usage.completion_tokens - 1) / (last - first text SSE timestamp)`. Usage includes reasoning tokens. SSE chunks can contain several tokens; this is a stream-boundary estimate.
 - Per-run MTP acceptance uses accepted/drafted counter deltas from `/metrics`. No other request traffic may occur during these measurements. The default 11-second post-request metrics wait must exceed the server's actual publication interval.
-- Speed rows show SM clock MHz and GPU power.draw W as min/median/max across eight boundary samples (four nodes before and after the phase). These are not continuous measurements or true phase peaks. Missing samples show N/A and the sample count.
+- Speed rows show SM clock MHz and GPU power.draw W as min/median/max across one-second samples from all four nodes during measured request windows. Warmup and metrics-settle gaps are excluded. Rows identify `in-phase 1s` or `boundary fallback`. Sampling can miss shorter peaks. Temperature and timestamped per-node samples are retained in JSON.
 - Before and after each phase, the harness records current/max SM clocks, temperature, power, and `gpu-clock-cap` service state on all four ranks. `fullclk` requires the service to be inactive on all four at both boundaries. Failed queries produce `unknown`. This label does not claim every sampled clock reaches the hardware maximum.
 - JSON receipts contain operational addresses, clock command output, and raw metrics. Review and redact them before sharing. The privacy scanner is an automated check, not a complete privacy review.
+
+### In-phase telemetry
+
+`BENCH_HOSTS` supplies four distinct comma-separated node addresses; `SSH_USER` supplies the SSH account. The defaults are documentation placeholders. Before each phase, the client starts one SSH sampler on each node:
+
+```text
+nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu --format=csv,noheader,nounits --loop=1
+```
+
+At phase end, the client signals each remote shell to kill and reap its sampler and then reaps the local SSH processes. Closing SSH input also triggers remote cleanup. No persistent sampler service is created, and no clock setting changes.
+
+In-phase summaries require valid samples inside measured request windows from every node and confirmed sampler cleanup. Otherwise, the table uses the before/after boundary samples and labels the fallback. Missing boundary samples show N/A with their count. Cleanup errors stay in the receipt. The local tests exercise the exact shell wrapper with a fake telemetry executable, including stdin-EOF cleanup; they do not contact a cluster.
 
 ### S4, smoke, and soak modes
 
@@ -187,14 +199,14 @@ All modes retain the explicit `--go` gate. Smoke, S4, and soak failures return a
 
 ## Results — placeholders only
 
-| Phase | Clock label | SM MHz min/med/max | GPU W min/med/max | Measured repeats | TTFT median (s) | Prefill proxy (tok/s) | S1 decode (tok/s) | MTP acceptance |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| 8K prefill | pending | — | — | — | — | — | — | — |
-| 32K prefill | pending | — | — | — | — | — | — | — |
-| Prose, 512 output | pending | — | — | — | — | — | — | — |
-| Code, 512 output | pending | — | — | — | — | — | — | — |
-| JSON, 512 output | pending | — | — | — | — | — | — | — |
-| S4, four × 512 output | pending | — | — | — | — | — | — | — |
+| Phase | Clock label | Sample source | SM MHz min/med/max | GPU W min/med/max | Measured repeats | TTFT median (s) | Prefill proxy (tok/s) | S1 decode (tok/s) | MTP acceptance |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 8K prefill | pending | pending | — | — | — | — | — | — | — |
+| 32K prefill | pending | pending | — | — | — | — | — | — | — |
+| Prose, 512 output | pending | pending | — | — | — | — | — | — | — |
+| Code, 512 output | pending | pending | — | — | — | — | — | — | — |
+| JSON, 512 output | pending | pending | — | — | — | — | — | — | — |
+| S4, four × 512 output | pending | pending | — | — | — | — | — | — | — |
 
 Record the resolved image digest, complete model revision, measured clock samples, KV-cache pool, run date, and hardware/network configuration alongside any future results. Do not compare rows with different clock settings without stating the difference.
 

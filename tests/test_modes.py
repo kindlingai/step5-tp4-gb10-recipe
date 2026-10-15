@@ -78,7 +78,7 @@ class ModeTests(unittest.TestCase):
         args=argparse.Namespace(mode=mode,base=self.base,prompts=str(self.folder/'prompts.json'),
                                 output=str(self.folder/'receipt.json'),metrics_settle=0,soak_seconds=duration,request_timeout=2)
         clock=lambda:{k:{'verified':True,'cap_state':'inactive','stdout':'STUB'} for k in bench.NODES}
-        result=bench.run(args,clock_reader=clock)
+        result=bench.run(args,clock_reader=clock,sampler_factory=bench.NoTelemetry)
         self.assertTrue((self.folder/'receipt.md').exists())
         self.assertEqual(json.loads((self.folder/'receipt.json').read_text())['passed'],result['passed'])
         return result

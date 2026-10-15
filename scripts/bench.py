@@ -18,7 +18,7 @@ import urllib.request
 import uuid
 
 CLOCK_CMD = 'nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,temperature.gpu,power.draw --format=csv; gpu_rc=$?; systemctl is-active gpu-clock-cap; cap_rc=$?; printf "GPU_RC=%s CAP_RC=%s\\n" "$gpu_rc" "$cap_rc"'
-NODES = {f'rank{i}':host for i,host in enumerate(os.environ.get('BENCH_HOSTS', '192.168.50.11,192.168.50.12,192.168.50.13,192.168.50.14').split(','))}
+NODES = {f'rank{i}':host.strip() for i,host in enumerate(os.environ.get('BENCH_HOSTS', '192.168.50.11,192.168.50.12,192.168.50.13,192.168.50.14').split(','))}
 SSH_USER = os.environ.get('SSH_USER', '')
 
 def utc(): return datetime.now(timezone.utc).isoformat()
@@ -59,7 +59,7 @@ def clocks():
         name,host=item
         start=utc()
         try:
-            p=subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10',f'{SSH_USER}@{host}' if SSH_USER else host,CLOCK_CMD],capture_output=True,text=True,timeout=25)
+            p=subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=10',ssh_target(host),CLOCK_CMD],capture_output=True,text=True,timeout=25)
             lines=p.stdout.splitlines()
             cap=next((s for s in lines if s in ('active','inactive','failed','activating','deactivating','unknown')),None)
             gpu_ok='GPU_RC=0 ' in p.stdout
@@ -73,6 +73,105 @@ def clock_label(before,after):
     if len(snapshots)!=8 or not all(s.get('verified') for s in snapshots): return 'unknown'
     if all(s['cap_state']=='inactive' for s in snapshots): return 'fullclk'
     return 'cap-active-or-mixed'
+
+# Closing the SSH input also stops the remote child. No persistent service is created.
+SAMPLER_CMD = """sampler_pid=
+cleanup() { if [ -n "$sampler_pid" ]; then kill "$sampler_pid" 2>/dev/null; wait "$sampler_pid" 2>/dev/null; fi; }
+trap cleanup EXIT
+trap 'exit 143' HUP INT TERM
+nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu --format=csv,noheader,nounits --loop=1 &
+sampler_pid=$!
+IFS= read -r stop
+exit 0
+"""
+
+def ssh_target(host):
+    return f'{SSH_USER}@{host}' if SSH_USER else host
+
+class PhaseSampler:
+    def __init__(self, nodes=None, command_factory=None, startup_timeout=12):
+        self.nodes=NODES if nodes is None else nodes
+        self.command_factory=command_factory or (lambda host:['ssh','-T','-o','BatchMode=yes','-o','ConnectTimeout=10',ssh_target(host),SAMPLER_CMD])
+        self.startup_timeout=startup_timeout
+        self.records={name:{'host':host,'samples':[],'errors':[],'cleanup_confirmed':False} for name,host in self.nodes.items()}
+        self.processes={};self.threads={};self.ready={name:threading.Event() for name in self.nodes}
+        self.lock=threading.Lock();self.stopped=False;self.start_utc=None
+    def _read(self,name,process):
+        try:
+            for line in process.stdout:
+                fields=line.strip().split(',')
+                try:
+                    if len(fields)!=3:raise ValueError('Expected three telemetry columns')
+                    values=[float(x.strip()) for x in fields]
+                    if not all(math.isfinite(v) for v in values):raise ValueError('Nonfinite telemetry')
+                    sample=dict(zip(('sm_mhz','power_w','temperature_c'),values))
+                    sample.update(utc=utc(),monotonic_s=time.perf_counter())
+                    with self.lock:self.records[name]['samples'].append(sample)
+                except ValueError:
+                    with self.lock:
+                        if len(self.records[name]['errors'])<20:self.records[name]['errors'].append(line.strip())
+                self.ready[name].set()
+        except Exception as error:
+            with self.lock:self.records[name]['errors'].append(repr(error))
+        finally:self.ready[name].set()
+    def start(self):
+        self.start_utc=utc()
+        for name,host in self.nodes.items():
+            try:
+                process=subprocess.Popen(self.command_factory(host),stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT,text=True,bufsize=1)
+                self.processes[name]=process
+                thread=threading.Thread(target=self._read,args=(name,process),daemon=True)
+                self.threads[name]=thread;thread.start()
+            except Exception as error:
+                self.records[name]['errors'].append(repr(error));self.ready[name].set()
+        deadline=time.perf_counter()+self.startup_timeout
+        for event in self.ready.values():event.wait(max(0,deadline-time.perf_counter()))
+        return self
+    def snapshot(self):
+        with self.lock:
+            nodes={name:{**r,'samples':list(r['samples']),'errors':list(r['errors'])} for name,r in self.records.items()}
+        return {'interval_s':1,'started_utc':self.start_utc,'stopped':self.stopped,'nodes':nodes}
+    def stop(self):
+        if self.stopped:return self.snapshot()
+        # Signal every remote shell first, then reap them in parallel.
+        for name,process in self.processes.items():
+            try:
+                process.stdin.write('stop\n');process.stdin.flush();process.stdin.close()
+            except (BrokenPipeError,OSError,ValueError):pass
+        def reap(item):
+            name,process=item
+            try:process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.records[name]['errors'].append('Graceful sampler stop timed out; remote cleanup unconfirmed')
+                process.terminate()
+                try:process.wait(timeout=3)
+                except subprocess.TimeoutExpired:process.kill();process.wait(timeout=3)
+            self.threads[name].join(timeout=2)
+            if self.threads[name].is_alive():self.records[name]['errors'].append('Sampler reader did not stop')
+            else:process.stdout.close()
+            self.records[name]['returncode']=process.returncode
+            self.records[name]['cleanup_confirmed']=process.returncode==0 and not self.threads[name].is_alive()
+        with ThreadPoolExecutor(max_workers=4) as pool:list(pool.map(reap,self.processes.items()))
+        self.stopped=True
+        return self.snapshot()
+
+class NoTelemetry:
+    """Dependency injection for local unit tests; never runs a remote command."""
+    def start(self):return self
+    def snapshot(self):return {'interval_s':1,'stopped':True,'nodes':{}}
+    def stop(self):return self.snapshot()
+
+def request_windows(phase):
+    results=[]
+    if 'request' in phase:results.append(phase['request'].get('result'))
+    for entry in phase.get('runs',[]):
+        if not entry.get('case',{}).get('warmup'):
+            if 'result' in entry:results.append(entry['result'])
+            for stream_entry in entry.get('batch',{}).get('streams',[]):results.append(stream_entry.get('result'))
+    for batch in phase.get('batches',[]):
+        for stream_entry in batch['streams']:results.append(stream_entry.get('result'))
+    return [(r['start_monotonic_s'],r['start_monotonic_s']+r['total_s']) for r in results if r and 'start_monotonic_s' in r]
 
 def stream(base, payload, expected_prompt_tokens, timeout=900, keep_events=True):
     request=urllib.request.Request(base.rstrip('/')+'/chat/completions',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})
@@ -118,30 +217,47 @@ def stats(values):
     values=[v for v in values if v is not None]
     return {'n':len(values),'median':statistics.median(values),'mean':statistics.mean(values),'min':min(values),'max':max(values)} if values else None
 
-def phase_hardware(phase):
+def boundary_hardware(phase):
     """Summarize only the four-node before/after snapshots, not unsampled peaks."""
-    values={'sm_mhz':[], 'power_w':[]}
+    values={'sm_mhz':[], 'power_w':[], 'temperature_c':[]}
     for boundary in ('clock_before','clock_after'):
         for node in phase.get(boundary,{}).values():
             if not node.get('verified'):continue
             for line in node.get('stdout','').splitlines():
                 cells=line.split(',')
                 if len(cells)!=4:continue
-                for key,index in (('sm_mhz',0),('power_w',3)):
-                    match=re.fullmatch(r'\s*([0-9]+(?:\.[0-9]+)?)\s*(?:MHz|W)?\s*',cells[index])
+                for key,index in (('sm_mhz',0),('power_w',3),('temperature_c',2)):
+                    match=re.fullmatch(r'\s*([0-9]+(?:\.[0-9]+)?)\s*(?:MHz|W|C)?\s*',cells[index])
                     if match:values[key].append(float(match[1]))
-    return {'sampling':'Four nodes, before and after the phase; not continuous telemetry.',
+    return {'source':'boundary fallback','sampling':'Four nodes, before and after the phase; not continuous telemetry.',
             'expected_samples':8, **{key:stats(items) for key,items in values.items()}}
+
+def phase_hardware(phase):
+    telemetry=phase.get('telemetry',{})
+    windows=request_windows(phase)
+    nodes=telemetry.get('nodes',{})
+    selected={name:[sample for sample in node['samples'] if any(start<=sample['monotonic_s']<=end for start,end in windows)]
+              for name,node in nodes.items()}
+    good=telemetry.get('stopped') and len(nodes)==4 and all(
+        node.get('cleanup_confirmed') and not node.get('errors') and selected[name] for name,node in nodes.items())
+    if good:
+        samples=[sample for group in selected.values() for sample in group]
+        return {'source':'in-phase 1s','sampling':'One-second samples within measured request windows; warmup and metrics-settle gaps excluded.',
+                'node_sample_counts':{name:len(group) for name,group in selected.items()},
+                **{key:stats([sample[key] for sample in samples]) for key in ('sm_mhz','power_w','temperature_c')}}
+    summary=boundary_hardware(phase)
+    summary['fallback_reason']='In-phase telemetry missing, incomplete, failed, or no sample inside every node request window.'
+    return summary
 
 def hardware_cell(phase,key):
     summary=phase_hardware(phase);value=summary[key]
     count=value['n'] if value else 0
-    if count!=summary['expected_samples']:return f'N/A ({count}/8 samples)'
+    if summary['source']=='boundary fallback' and count!=summary['expected_samples']:return f'N/A ({count}/8 samples)'
     places=0 if key=='sm_mhz' else 1
     return ' / '.join(f'{value[k]:.{places}f}' for k in ('min','median','max'))
 
 def markdown(receipt):
-    lines=['# Step-5 TP4 first numbers','', '| Phase | Clock label | SM MHz min/med/max | GPU W min/med/max | n | TTFT median (s) | Prompt tok/s proxy median | S1 decode tok/s median | MTP accepted/drafted |', '|---|---|---:|---:|---:|---:|---:|---:|---:|']
+    lines=['# Step-5 TP4 first numbers','', '| Phase | Clock label | Sample source | SM MHz min/med/max | GPU W min/med/max | n | TTFT median (s) | Prompt tok/s proxy median | S1 decode tok/s median | MTP accepted/drafted |', '|---|---|---|---:|---:|---:|---:|---:|---:|---:|']
     for phase in receipt['phases']:
         if phase.get('kind')=='s4': continue
         runs=[r for r in phase['runs'] if not r['case']['warmup'] and 'result' in r]
@@ -151,13 +267,13 @@ def markdown(receipt):
         pairs=[r['mtp'] for r in runs if r.get('mtp',{}).get('acceptance_fraction') is not None]
         draft=sum(p['draft_tokens'] for p in pairs); accepted=sum(p['accepted_tokens'] for p in pairs)
         rate=f'{100*accepted/draft:.1f}%' if draft else 'N/A'
-        lines.append(f"| {phase['name']} | {phase['clock_label']} | {hardware_cell(phase,'sm_mhz')} | {hardware_cell(phase,'power_w')} | {len(runs)} | {median('ttft_s')} | {median('prompt_tok_s_proxy') if phase['name'].startswith('prefill') else '—'} | {median('decode_tok_s') if phase['name'].startswith('decode') else '—'} | {rate} |")
+        lines.append(f"| {phase['name']} | {phase['clock_label']} | {phase_hardware(phase)['source']} | {hardware_cell(phase,'sm_mhz')} | {hardware_cell(phase,'power_w')} | {len(runs)} | {median('ttft_s')} | {median('prompt_tok_s_proxy') if phase['name'].startswith('prefill') else '—'} | {median('decode_tok_s') if phase['name'].startswith('decode') else '—'} | {rate} |")
     lines += ['', 'Prefill uses 1 warmup + 3 measured requests at each size. Decode uses 3 requests per type.',
               'Prompt tok/s is prompt_tokens / client TTFT, not a GPU-only prefill rate.',
               'Decode counts all usage completion tokens, including reasoning. SSE times are approximate token boundaries.',
               'MTP ratios use global server counter deltas. Other traffic invalidates per-request attribution.',
               'fullclk means gpu-clock-cap was inactive on all four ranks before and after the phase; raw clocks are in JSON.',
-              'SM clock and power ranges use eight boundary samples: all four nodes before and after each phase, not continuous telemetry.',
+              'SM clock and power ranges prefer one-second in-phase samples across four nodes; boundary samples are explicitly labelled fallback.',
               'These are preliminary three-repeat measurements, not a quality evaluation.']
     warns=[w for p in receipt['phases'] for r in p['runs'] for w in r.get('result',{}).get('warnings',[])]
     if warns: lines += ['','Warnings: '+', '.join(sorted(set(warns)))+'.']
@@ -165,7 +281,9 @@ def markdown(receipt):
     if receipt.get('error'): lines += ['','INCOMPLETE: '+receipt['error']]
     return '\n'.join(lines)+'\n'
 
-def run(args, clock_reader=clocks):
+def run(args, clock_reader=clocks, sampler_factory=PhaseSampler):
+    if len(NODES)!=4 or len(set(NODES.values()))!=4 or any(not host for host in NODES.values()):
+        raise ValueError('BENCH_HOSTS must contain four distinct hosts')
     fixture=json.loads(Path(args.prompts).read_text())
     base=args.base.rstrip('/'); metrics_url=base.rsplit('/v1',1)[0]+'/metrics'
     receipt={'schema':2,'started_utc':utc(),'client_host':os.environ.get('CLIENT_LABEL', 'client'),'client_python':__import__('sys').version,
@@ -174,7 +292,12 @@ def run(args, clock_reader=clocks):
              'fixture_sha256':hashlib.sha256(Path(args.prompts).read_bytes()).hexdigest(),
              'fixture':fixture,'mode':getattr(args,'mode','s1'),'mtp_config_expected':3,'metrics_settle_s':args.metrics_settle,'phases':[]}
     output=Path(args.output); output.parent.mkdir(parents=True,exist_ok=True)
+    active_samplers=[]
+    def begin_sampling(item):
+        sampler=sampler_factory();active_samplers.append((item,sampler));sampler.start();item['telemetry']=sampler.snapshot()
+        return sampler
     def save():
+        for item,sampler in active_samplers:item['telemetry']=sampler.snapshot()
         for item in receipt['phases']+[receipt[k] for k in ('smoke','soak') if k in receipt]:
             item['hardware_summary']=phase_hardware(item)
         temp=output.with_suffix('.tmp'); temp.write_text(json.dumps(receipt,indent=2)+'\n'); temp.replace(output)
@@ -183,11 +306,12 @@ def run(args, clock_reader=clocks):
         receipt['models']=json.loads(get(base+'/models'))
         assert fixture['model'] in [x['id'] for x in receipt['models']['data']], 'Expected model missing'
         mode=getattr(args,'mode','s1')
-        if mode=='smoke': run_smoke(args,fixture,receipt,save,clock_reader)
-        if mode=='soak': run_soak(args,fixture,receipt,save,clock_reader)
+        if mode=='smoke': run_smoke(args,fixture,receipt,save,clock_reader,begin_sampling)
+        if mode=='soak': run_soak(args,fixture,receipt,save,clock_reader,begin_sampling)
         for name in (dict.fromkeys(c['phase'] for c in fixture['cases']) if mode in ('bench','s1') else []):
             phase={'name':name,'clock_before':clock_reader(),'clock_label':'pending','runs':[]}
             receipt['phases'].append(phase); save()
+            sampler=begin_sampling(phase)
             try:
                 for case in [c for c in fixture['cases'] if c['phase']==name]:
                     entry={'case':case}; phase['runs'].append(entry)
@@ -206,16 +330,18 @@ def run(args, clock_reader=clocks):
                     print(name,case['rep'],json.dumps({k:entry['result'][k] for k in ('ttft_s','decode_tok_s','usage','warnings')}),flush=True)
                     save()
             finally:
+                phase['telemetry']=sampler.stop()
                 phase['clock_after']=clock_reader()
                 phase['clock_label']=clock_label(phase['clock_before'],phase['clock_after'])
                 phase['summary']={k:stats([r['result'][k] for r in phase['runs'] if 'result' in r and not r['case']['warmup']]) for k in ('ttft_s','prompt_tok_s_proxy','decode_tok_s')}
                 save()
-        if mode in ('bench','s4'): run_s4(args,fixture,receipt,save,clock_reader)
+        if mode in ('bench','s4'): run_s4(args,fixture,receipt,save,clock_reader,begin_sampling)
         receipt['complete']=True
         receipt.setdefault('passed',True)
     except Exception as e:
         receipt['complete']=False; receipt['passed']=False; receipt['error']=repr(e); receipt['error_detail']=error_record(e); raise
     finally:
+        for item,sampler in active_samplers:item['telemetry']=sampler.stop()
         receipt['ended_utc']=utc(); save()
     return receipt
 
@@ -267,13 +393,14 @@ def concurrent_batch(base, model, cases, timeout=900, keep_events=True):
             'end_to_end_tok_s':tokens/wall if all_pass and wall>0 else None,
             'per_stream_tok_s':[e.get('result',{}).get('decode_tok_s') for e in entries]}
 
-def run_s4(args, fixture, receipt, save, clock_reader):
+def run_s4(args, fixture, receipt, save, clock_reader, begin_sampling):
     base=args.base.rstrip('/');url=base.rsplit('/v1',1)[0]+'/metrics'
     batches=fixture['s4_batches']
     if len(batches)!=3 or any(len(b)!=4 or any(c['max_tokens']!=512 for c in b) for b in batches):
         raise ValueError('S4 requires three batches of four 512-token streams')
     phase={'name':'decode_s4','kind':'s4','clock_before':clock_reader(),'clock_label':'pending','runs':[]}
     receipt['phases'].append(phase);save()
+    sampler=begin_sampling(phase)
     try:
         for rep,cases in enumerate(batches,1):
             entry={'rep':rep,'metrics_before':metrics(url)}
@@ -288,6 +415,7 @@ def run_s4(args, fixture, receipt, save, clock_reader):
             print('decode_s4',rep,json.dumps({k:entry['batch'][k] for k in ('passed','aggregate_decode_tok_s','per_stream_tok_s')}),flush=True)
             save()
     finally:
+        phase['telemetry']=sampler.stop()
         phase['clock_after']=clock_reader();phase['clock_label']=clock_label(phase['clock_before'],phase['clock_after'])
         phase['summary']={'aggregate_decode_tok_s':stats([r['batch']['aggregate_decode_tok_s'] for r in phase['runs'] if 'batch' in r]),
                           'per_stream_tok_s':stats([v for r in phase['runs'] if 'batch' in r for v in r['batch']['per_stream_tok_s']])}
@@ -304,9 +432,10 @@ def smoke_checks(result):
     return {'expected_answer':'Two plus two equals four.','checks':checks,'passed':all(checks.values()),
             'scope':'Constrained arithmetic/instruction-following check, not a general quality assessment.'}
 
-def run_smoke(args, fixture, receipt, save, clock_reader):
+def run_smoke(args, fixture, receipt, save, clock_reader, begin_sampling):
     data={'clock_before':clock_reader(),'clock_label':'pending'}
     receipt['smoke']=data;save()
+    sampler=begin_sampling(data)
     try:
         batch=concurrent_batch(args.base,fixture['model'],[fixture['smoke_case']],getattr(args,'request_timeout',180))
         data['request']=batch['streams'][0]
@@ -316,9 +445,10 @@ def run_smoke(args, fixture, receipt, save, clock_reader):
         else:data['passed']=False
         receipt['passed']=data['passed']
     finally:
+        data['telemetry']=sampler.stop()
         data['clock_after']=clock_reader();data['clock_label']=clock_label(data['clock_before'],data['clock_after']);save()
 
-def run_soak(args, fixture, receipt, save, clock_reader):
+def run_soak(args, fixture, receipt, save, clock_reader, begin_sampling):
     duration=getattr(args,'soak_seconds',600)
     data={'target_duration_s':duration,'clock_before':clock_reader(),'clock_label':'pending',
           'batches':[],'errors':[],'prompt_policy':'Reuse the prepared short-chat, exact-8K, and decode pool; cache hits are allowed.',
@@ -328,6 +458,7 @@ def run_soak(args, fixture, receipt, save, clock_reader):
     data['request_log']=logfile.name
     workloads=fixture['soak_cases']
     if len(workloads)!=3:raise ValueError('Soak requires short chat, 8K, and decode cases')
+    sampler=begin_sampling(data)
     start=time.perf_counter();batch_index=0;cursor=0;seen_concurrency=set();seen_workloads=set()
     try:
         with logfile.open('w') as log:
@@ -348,6 +479,7 @@ def run_soak(args, fixture, receipt, save, clock_reader):
                 batch_index+=1
                 save()
     finally:
+        data['telemetry']=sampler.stop()
         data['duration_s']=time.perf_counter()-start
         data['concurrency_seen']=sorted(seen_concurrency);data['workloads_seen']=sorted(seen_workloads)
         data['request_count']=sum(len(b['streams']) for b in data['batches'])
@@ -362,12 +494,12 @@ def extra_markdown(receipt):
     def fmt(value):return '—' if value is None else f'{value:.2f}'
     for phase in receipt.get('phases',[]):
         if phase.get('kind')!='s4':continue
-        lines += ['', '## Decode S4', '', '| Rep | Clock label | SM MHz min/med/max | GPU W min/med/max | Aggregate decode tok/s | Per-stream tok/s (0 / 1 / 2 / 3) | Pass |',
-                  '|---:|---|---:|---:|---:|---|---|']
+        lines += ['', '## Decode S4', '', '| Rep | Clock label | Sample source | SM MHz min/med/max | GPU W min/med/max | Aggregate decode tok/s | Per-stream tok/s (0 / 1 / 2 / 3) | Pass |',
+                  '|---:|---|---|---:|---:|---:|---|---|']
         for entry in phase['runs']:
             if 'batch' not in entry:continue
             b=entry['batch']
-            lines.append(f"| {entry['rep']} | {phase['clock_label']} | {hardware_cell(phase,'sm_mhz')} | {hardware_cell(phase,'power_w')} | {fmt(b['aggregate_decode_tok_s'])} | {' / '.join(fmt(x) for x in b['per_stream_tok_s'])} | {b['passed']} |")
+            lines.append(f"| {entry['rep']} | {phase['clock_label']} | {phase_hardware(phase)['source']} | {hardware_cell(phase,'sm_mhz')} | {hardware_cell(phase,'power_w')} | {fmt(b['aggregate_decode_tok_s'])} | {' / '.join(fmt(x) for x in b['per_stream_tok_s'])} | {b['passed']} |")
         lines += ['', 'Aggregate decode = sum(N − 1) divided by the interval from earliest first text SSE to latest last text SSE.',
                   'Each batch has four concurrent 512-token streams. MTP deltas apply to the whole batch.']
     if 'smoke' in receipt:
