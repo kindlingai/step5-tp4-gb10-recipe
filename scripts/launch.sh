@@ -12,6 +12,9 @@ NAME=${CONTAINER_PREFIX:-step5}-r$R
 if docker container inspect "$NAME" >/dev/null 2>&1; then
   echo "Container $NAME already exists; inspect and remove it explicitly before another launch" >&2; exit 2
 fi
+# Dense attention: the DSA kernels in this image require SM90/SM103.
+DENSE_ARGS=(); [[ ${STEP5_DENSE:-1} != 1 ]] || DENSE_ARGS=(--hf-overrides '{"text_config":{"sparse_config":{"enabled":false}}}')
+LM_ARGS=(); [[ ${LMONLY:-1} != 1 ]] || LM_ARGS=(--language-model-only)
 mkdir -p "$CACHE_DIR"
 HEAD_ARGS=(); [[ $R == 0 ]] || HEAD_ARGS=(--headless)
 RDMA_ARGS=(); [[ -z ${RDMA_HCA:-} ]] || RDMA_ARGS=(-e "NCCL_IB_HCA=$RDMA_HCA")
@@ -27,8 +30,8 @@ docker run -d --name "$NAME" --gpus all --ipc=host --network=host --shm-size 16g
   --served-model-name step5 --host 0.0.0.0 --port "${API_PORT:-18000}" \
   --tensor-parallel-size 4 --nnodes 4 --node-rank "$R" --master-addr "$NODE0" --master-port "${MASTER_PORT:-29511}" \
   --distributed-executor-backend mp --disable-custom-all-reduce \
-  --max-model-len "${MAXLEN:-65536}" --max-num-batched-tokens "${BATCH_TOKENS:-16384}" --max-num-seqs "${MAXSEQ:-8}" \
-  --gpu-memory-utilization "${GMU:-0.87}" --enable-prefix-caching --kv-cache-dtype "${KV_DTYPE:-fp8}" \
+  --max-model-len "${MAXLEN:-65536}" --max-num-batched-tokens "${BATCH_TOKENS:-4096}" --max-num-seqs "${MAXSEQ:-8}" \
+  --gpu-memory-utilization "${GMU:-0.82}" --enable-prefix-caching --kv-cache-dtype "${KV_DTYPE:-auto}" \
   --trust-remote-code "${SPEC_ARGS[@]}" \
-  --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5 "$@"
+  --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5 "${DENSE_ARGS[@]}" "${LM_ARGS[@]}" "$@"
 printf 'Started %s at rank %s\n' "$NAME" "$R"

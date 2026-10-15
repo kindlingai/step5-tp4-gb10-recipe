@@ -2,6 +2,8 @@
 
 A recipe skeleton for `stepfun-ai/Step-5-Preview-NVFP4` with vLLM tensor parallelism across four NVIDIA DGX Spark systems (GB10).
 
+**Configuration:** dense attention (DSA kernels need SM90/SM103 in this vLLM image), BF16 KV via `auto`, text-only, MTP3.
+
 **Status:** CPU-tested recipe draft. The generalized launch and NFS scripts have not been validated on a live cluster. No performance result is claimed below.
 
 ## Hardware and software
@@ -110,19 +112,36 @@ Default vLLM configuration:
 ```text
 --tensor-parallel-size 4 --nnodes 4
 --distributed-executor-backend mp --disable-custom-all-reduce
---max-model-len 65536 --max-num-batched-tokens 16384 --max-num-seqs 8
---gpu-memory-utilization 0.87
---enable-prefix-caching --kv-cache-dtype fp8
+--max-model-len 65536 --max-num-batched-tokens 4096 --max-num-seqs 8
+--gpu-memory-utilization 0.82
+--enable-prefix-caching --kv-cache-dtype auto
 --spec-method mtp --spec-tokens 3
 --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5
---trust-remote-code
+--trust-remote-code --language-model-only
+--hf-overrides '{"text_config":{"sparse_config":{"enabled":false}}}'
 ```
 
 Rank 0 serves the OpenAI-compatible API on port 18000. Other ranks use `--headless`. The master address is `NODE0`; the default master port is 29511. The launcher sets `VLLM_HOST_IP`, `NCCL_SOCKET_IFNAME`, and `GLOO_SOCKET_IFNAME`. Set `RDMA_HCA` when NCCL needs an explicit HCA selection.
 
+### Attention and KV compatibility
+
+The current configuration is **dense attention (DSA kernels need SM90/SM103 in this vLLM image)**. GB10 is SM121, so the default override disables sparse attention:
+
+```json
+{"text_config":{"sparse_config":{"enabled":false}}}
+```
+
+This changes attention behavior. No quality-equivalence claim is made for dense versus sparse attention, and this draft reports no measured quality result. `STEP5_DENSE=1` enables the override by default.
+
+The FA2 path on SM121 in this image does not support FP8 KV. Therefore, `KV_DTYPE=auto` selects the model's BF16 KV dtype rather than FP8. This is a KV-cache choice; the checkpoint remains NVFP4. It is not a claim that all attention backends on SM121 lack FP8 KV support.
+
+For comparison, the separate [0xSero four-Spark recipe README](https://github.com/0xSero/Step-5-Preview-Four-Sparks/blob/main/README.md#configuration), checked on 2026-10-15, specifies **FP16 KV** matching its FP16 model dtype. It is not an FP8-KV recipe. Its configuration is different; no performance or quality equivalence is implied.
+
+`LMONLY=1` enables `--language-model-only` by default, so this recipe serves text and does not load the vision encoder. The current defaults are memory utilization 0.82, a 4096-token batch limit, and three MTP draft tokens. The environment example and launcher use the same defaults.
+
 `SPEC_TOKENS=0` disables the speculative arguments. Extra vLLM arguments may follow the rank. No optional MoE overlay is included in this baseline.
 
-The launcher refuses to replace an existing container with the same name. Inspect logs and stop/remove old containers explicitly before another launch. Verify image identity, model readiness, memory allocation, and the actual KV-cache token pool before recording results. FP8 KV is requested; its capacity and sliding-window behavior are not yet verified by this draft.
+The launcher refuses to replace an existing container with the same name. Inspect logs and stop/remove old containers explicitly before another launch. Verify image identity, model readiness, memory allocation, and the actual KV-cache token pool before recording results. This configuration requests `--kv-cache-dtype auto`, which uses BF16 KV for this model. Its actual KV capacity is not yet verified by this draft.
 
 This configuration exposes the API on the host network without authentication. Use a trusted isolated network or add an appropriate authenticated front end. Do not expose it directly to the internet.
 
