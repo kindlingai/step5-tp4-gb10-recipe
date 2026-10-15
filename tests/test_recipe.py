@@ -47,7 +47,7 @@ class RecipeTests(unittest.TestCase):
             mock=base/'docker'
             mock.write_text('#!/usr/bin/env python3\nimport json,os,sys\nif sys.argv[1:3]==["container","inspect"]:sys.exit(1)\nwith open(os.environ["MOCK_LOG"],"a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")\nprint("mock-container")\n')
             mock.chmod(0o755)
-            env={**os.environ,'STEP5_CONFIG':'','STEP5_ROOT':str(storage),'CACHE_DIR':str(base/'cache'),'PATH':str(base)+os.pathsep+os.environ['PATH'],'MOCK_LOG':str(base/'calls'),'GMU':'0.85','BATCH_TOKENS':'4096','KV_DTYPE':'auto','STEP5_DENSE':'1','LMONLY':'1','SPEC_TOKENS':'0'}
+            env={**os.environ,'STEP5_CONFIG':'','STEP5_ROOT':str(storage),'CACHE_DIR':str(base/'cache'),'PATH':str(base)+os.pathsep+os.environ['PATH'],'MOCK_LOG':str(base/'calls'),'GMU':'0.85','BATCH_TOKENS':'4096','KV_DTYPE':'auto','STEP5_DENSE':'1','LMONLY':'1','SPEC_TOKENS':'3','DROP_PAGE_CACHE':'0'}
             for rank in range(4):
                 p=shell('launch.sh',rank,env=env);self.assertEqual(p.returncode,0,p.stderr)
             calls=[json.loads(x) for x in (base/'calls').read_text().splitlines()]
@@ -57,11 +57,18 @@ class RecipeTests(unittest.TestCase):
                     self.assertEqual(call[call.index(flag)+1],value)
                 self.assertEqual('--headless' in call,rank!=0)
                 self.assertIn('--language-model-only',call)
-                self.assertNotIn('--spec-method',call)
-                self.assertNotIn('--spec-tokens',call)
+                self.assertEqual(call[call.index('--spec-method')+1],'mtp')
+                self.assertEqual(call[call.index('--spec-tokens')+1],'3')
                 self.assertEqual(json.loads(call[call.index('--hf-overrides')+1]),{'text_config':{'sparse_config':{'enabled':False}}})
                 self.assertIn(f'type=bind,source={storage},target={storage},readonly',call)
             p=shell('launch.sh',4,env=env);self.assertNotEqual(p.returncode,0)
+    def test_page_cache_loop_dry_run(self):
+        p=shell('drop-page-cache.sh','--dry-run')
+        self.assertEqual(p.returncode,0,p.stderr)
+        lines=p.stdout.splitlines();self.assertEqual(len(lines),90)
+        self.assertTrue(lines[0].startswith('t=0s:'))
+        self.assertTrue(lines[-1].startswith('t=890s:'))
+        self.assertTrue(all('echo 1 > /proc/sys/vm/drop_caches' in line for line in lines))
     def test_checksums(self):
         with tempfile.TemporaryDirectory() as d:
             base=Path(d);w=base/'weights';w.mkdir()

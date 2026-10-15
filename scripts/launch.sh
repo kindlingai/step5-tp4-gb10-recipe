@@ -15,10 +15,15 @@ fi
 # Dense attention: the DSA kernels in this image require SM90/SM103.
 DENSE_ARGS=(); [[ ${STEP5_DENSE:-1} != 1 ]] || DENSE_ARGS=(--hf-overrides '{"text_config":{"sparse_config":{"enabled":false}}}')
 LM_ARGS=(); [[ ${LMONLY:-1} != 1 ]] || LM_ARGS=(--language-model-only)
+# The boot workaround runs on the host, not inside the inference container.
+if [[ ${DROP_PAGE_CACHE:-1} == 1 && ! -w /proc/sys/vm/drop_caches ]]; then
+  echo 'Run the launcher with elevated host privileges for the page-cache workaround, or set DROP_PAGE_CACHE=0 explicitly' >&2
+  exit 2
+fi
 mkdir -p "$CACHE_DIR"
 HEAD_ARGS=(); [[ $R == 0 ]] || HEAD_ARGS=(--headless)
 RDMA_ARGS=(); [[ -z ${RDMA_HCA:-} ]] || RDMA_ARGS=(-e "NCCL_IB_HCA=$RDMA_HCA")
-SPEC_ARGS=(); if (( ${SPEC_TOKENS:-0} > 0 )); then SPEC_ARGS=(--spec-method mtp --spec-tokens "${SPEC_TOKENS:-0}"); fi
+SPEC_ARGS=(); if (( ${SPEC_TOKENS:-3} > 0 )); then SPEC_ARGS=(--spec-method mtp --spec-tokens "${SPEC_TOKENS:-3}"); fi
 docker run -d --name "$NAME" --gpus all --ipc=host --network=host --shm-size 16g \
   --ulimit memlock=-1 --device /dev/infiniband \
   --mount "type=bind,source=$STEP5_ROOT,target=$STEP5_ROOT,readonly" \
@@ -34,4 +39,8 @@ docker run -d --name "$NAME" --gpus all --ipc=host --network=host --shm-size 16g
   --gpu-memory-utilization "${GMU:-0.85}" --enable-prefix-caching --kv-cache-dtype "${KV_DTYPE:-auto}" \
   --trust-remote-code "${SPEC_ARGS[@]}" \
   --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5 "${DENSE_ARGS[@]}" "${LM_ARGS[@]}" "$@"
-printf 'Started %s at rank %s\n' "$NAME" "$R"
+if [[ ${DROP_PAGE_CACHE:-1} == 1 ]]; then
+  nohup "$RECIPE_DIR/scripts/drop-page-cache.sh" > "$CACHE_DIR/page-cache-drop.log" 2>&1 < /dev/null &
+  echo "$!" > "$CACHE_DIR/page-cache-drop.pid"
+fi
+printf 'Started %s at rank %s\n'  "$NAME" "$R"

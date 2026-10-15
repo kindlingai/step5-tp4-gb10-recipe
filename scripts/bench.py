@@ -290,7 +290,7 @@ def run(args, clock_reader=clocks, sampler_factory=PhaseSampler):
              'endpoint':base,'model':fixture['model'],'tokenizer_revision':fixture['tokenizer_revision'],
              'tokenizer_sha256':fixture['tokenizer_sha256'],'script_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
              'fixture_sha256':hashlib.sha256(Path(args.prompts).read_bytes()).hexdigest(),
-             'fixture':fixture,'mode':getattr(args,'mode','s1'),'mtp_config_expected':getattr(args,'mtp_tokens',0),'metrics_settle_s':args.metrics_settle,'phases':[]}
+             'fixture':fixture,'mode':getattr(args,'mode','s1'),'mtp_config_expected':getattr(args,'mtp_tokens',3),'metrics_settle_s':args.metrics_settle,'phases':[]}
     output=Path(args.output); output.parent.mkdir(parents=True,exist_ok=True)
     active_samplers=[]
     def begin_sampling(item):
@@ -517,7 +517,7 @@ def extra_markdown(receipt):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser()
-    p.add_argument('--mtp-tokens',type=int,default=0,help='Expected server MTP count; metadata only')
+    p.add_argument('--mtp-tokens',type=int,default=3,help='Expected server MTP count; metadata only')
     p.add_argument('--mode',choices=('bench','s1','s4','smoke','soak'),default='bench')
     p.add_argument('--soak-seconds',type=float,default=600)
     p.add_argument('--request-timeout',type=float,default=180)

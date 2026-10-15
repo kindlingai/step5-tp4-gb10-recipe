@@ -2,9 +2,9 @@
 
 A recipe skeleton for `stepfun-ai/Step-5-Preview-NVFP4` with vLLM tensor parallelism across four NVIDIA DGX Spark systems (GB10).
 
-**Configuration:** dense attention (DSA kernels need SM90/SM103 in this vLLM image), BF16 KV via `auto`, text-only, MTP disabled.
+**Configuration:** dense attention (DSA kernels need SM90/SM103 in this vLLM image), BF16 KV via `auto`, text-only, MTP3, 65536-token context.
 
-**Status:** CPU-tested recipe draft. The generalized launch and NFS scripts have not been validated on a live cluster. No performance result is claimed below.
+**Status:** The configuration below has measured benchmark and API-soak results on four systems. The generalized launch and NFS scripts are CPU-tested; those generalized scripts have not been validated end to end on a live cluster.
 
 ## Hardware and software
 
@@ -117,6 +117,7 @@ Default vLLM configuration:
 --enable-prefix-caching --kv-cache-dtype auto
 --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5
 --trust-remote-code --language-model-only
+--spec-method mtp --spec-tokens 3
 --hf-overrides '{"text_config":{"sparse_config":{"enabled":false}}}'
 ```
 
@@ -136,11 +137,25 @@ The FA2 path on SM121 in this image does not support FP8 KV. Therefore, `KV_DTYP
 
 For comparison, the separate [0xSero four-Spark recipe README](https://github.com/0xSero/Step-5-Preview-Four-Sparks/blob/main/README.md#configuration), checked on 2026-10-15, specifies **FP16 KV** matching its FP16 model dtype. It is not an FP8-KV recipe. Its configuration is different; no performance or quality equivalence is implied.
 
-`LMONLY=1` enables `--language-model-only` by default, so this recipe serves text and does not load the vision encoder. The current defaults are memory utilization 0.85, a 4096-token batch limit, and no MTP draft tokens. The environment example and launcher use the same defaults.
+`LMONLY=1` enables `--language-model-only` by default, so this recipe serves text and does not load the vision encoder. The current defaults are memory utilization 0.85, a 4096-token batch limit, and three MTP draft tokens. The environment example and launcher use the same defaults.
 
-`SPEC_TOKENS=0` is the default and omits all speculative arguments. MTP is disabled for this configuration; MTP acceptance is therefore N/A. An explicit positive `SPEC_TOKENS` value enables MTP for a separate configuration. Extra vLLM arguments may follow the rank. No optional MoE overlay is included in this baseline.
+`SPEC_TOKENS=3` is the default. Set `SPEC_TOKENS=0` to omit speculative arguments for a separate non-MTP configuration. Extra vLLM arguments may follow the rank. No optional MoE overlay is included in this baseline.
 
-The launcher refuses to replace an existing container with the same name. Inspect logs and stop/remove old containers explicitly before another launch. Verify image identity, model readiness, memory allocation, and the actual KV-cache token pool before recording results. This configuration requests `--kv-cache-dtype auto`, which uses BF16 KV for this model. Its actual KV capacity is not yet verified by this draft.
+The launcher refuses to replace an existing container with the same name. Inspect logs and stop/remove old containers explicitly before another launch. Verify image identity, model readiness, memory allocation, and the actual KV-cache token pool before recording results. This configuration requests `--kv-cache-dtype auto`, which uses BF16 KV for this model. The measured run reported a KV pool of 156,294 tokens, with 4.71 GiB allocated per rank. Verify capacity again after any configuration change.
+
+### Boot-time page-cache workaround
+
+By default, each launcher starts `scripts/drop-page-cache.sh` on its host immediately after the inference container starts. It writes `1` to `/proc/sys/vm/drop_caches` every 10 seconds for 15 minutes (90 writes). This drops clean page cache; it does not use value `3`. Run the launcher with elevated host privileges and preserve `STEP5_CONFIG` when changing accounts.
+
+This loop was used for the measured startup after earlier starts had NVRM errors during KV allocation. The successful startup was reported to have no such errors. This is an observed workaround, not a general driver fix or proof of causation. The benchmark client does not audit kernel logs.
+
+The helper exits after 15 minutes. Its log and PID are stored as `page-cache-drop.log` and `page-cache-drop.pid` under `CACHE_DIR`. Set `DROP_PAGE_CACHE=0` to disable it explicitly. Do not leave the loop running indefinitely. Dropping page cache affects other host workloads and can cause extra storage reads.
+
+To inspect the schedule without changing the host or waiting:
+
+```sh
+scripts/drop-page-cache.sh --dry-run
+```
 
 This configuration exposes the API on the host network without authentication. Use a trusted isolated network or add an appropriate authenticated front end. Do not expose it directly to the internet.
 
@@ -168,7 +183,7 @@ Copy only `scripts/bench.py` and the generated `scripts/prompts.json` to the cli
 export BENCH_HOSTS=192.168.50.11,192.168.50.12,192.168.50.13,192.168.50.14
 export SSH_USER=  # leave empty to use the SSH default, or set your account
 export CLIENT_LABEL=client
-python3 scripts/bench.py --go --mtp-tokens 0 \
+python3 scripts/bench.py --go --mtp-tokens 3 \
   --base http://192.168.50.11:18000/v1 --output receipt.json
 ```
 
@@ -215,18 +230,34 @@ Every soak request produces a JSONL record in `<output-stem>.requests.jsonl`, wi
 
 All modes retain the explicit `--go` gate. Smoke, S4, and soak failures return a nonzero CLI status. `complete` records whether the mode finished; `passed` records its outcome. Unit tests use short local stub soaks, not a ten-minute live run.
 
-## Results — placeholders only
+## Measured results — 64K context, MTP3
 
-| Phase | Clock label | Sample source | SM MHz min/med/max | GPU W min/med/max | Measured repeats | TTFT median (s) | Prefill proxy (tok/s) | S1 decode (tok/s) | MTP acceptance |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| 8K prefill | pending | pending | — | — | — | — | — | — | — |
-| 32K prefill | pending | pending | — | — | — | — | — | — | — |
-| Prose, 512 output | pending | pending | — | — | — | — | — | — | — |
-| Code, 512 output | pending | pending | — | — | — | — | — | — | — |
-| JSON, 512 output | pending | pending | — | — | — | — | — | — | — |
-| S4, four × 512 output | pending | pending | — | — | — | — | — | — | — |
+Measured on 2026-10-15 with the pinned model above, four GB10 systems, dense attention, BF16 KV, memory utilization 0.85, and a 4096-token batch limit. All benchmark requests passed without client warnings or memory-guard aborts. The measured configuration stays at 65536 context; no 128K result is claimed here. The resolved image digest and exact fabric hardware are not included in this result summary.
 
-Record the resolved image digest, complete model revision, measured clock samples, KV-cache pool, run date, and hardware/network configuration alongside any future results. Do not compare rows with different clock settings without stating the difference.
+Rates and TTFT are medians of three measured repetitions. Clock and power values are min/median/max across all four nodes in the measured request windows. Each row uses one-second in-phase telemetry. `fullclk` means the clock-cap service was inactive on every node at both phase boundaries, not that every sample reached maximum clock.
+
+| Phase | Clock label | Sample source | SM MHz min/med/max | GPU W min/med/max | TTFT median (s) | Prefill proxy (tok/s) | Decode (tok/s) | MTP accepted/drafted |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| 8K prefill | fullclk | in-phase 1s | 2405 / 2476 / 2561 | 12.0 / 41.8 / 45.5 | 6.97 | 1175.73 | — | N/A |
+| 32K prefill | fullclk | in-phase 1s | 2405 / 2476 / 2548 | 11.1 / 47.5 / 54.2 | 29.35 | 1116.56 | — | N/A |
+| S1 prose, 512 output | fullclk | in-phase 1s | 2405 / 2489 / 2574 | 15.6 / 33.6 / 37.8 | 0.38 | — | 27.93 | 948 / 1767 (53.7%) |
+| S1 code, 512 output | fullclk | in-phase 1s | 2405 / 2489 / 2574 | 11.1 / 33.7 / 38.0 | 0.40 | — | 30.05 | 981 / 1659 (59.1%) |
+| S1 JSON, 512 output | fullclk | in-phase 1s | 2405 / 2489 / 2574 | 11.1 / 33.6 / 36.7 | 0.41 | — | 28.79 | 963 / 1710 (56.3%) |
+| S4, four × 512 output | fullclk | in-phase 1s | 2405 / 2489 / 2574 | 11.9 / 39.5 / 43.7 | — | — | 60.89 aggregate; 16.08 per stream | 3882 / 6786 (57.2%) |
+
+S4 aggregate rates were 58.49, 62.51, and 60.89 tok/s. The per-stream figure is the median of all 12 streams. MTP ratios pool the accepted/drafted deltas across each row's runs. One-token prefill requests produced no MTP drafts. Minimum observed host MemAvailable was 5.2458 GiB; maximum GPU temperature was 67 C. A separate client supervisor aborted below 4 GiB on any rank; that private supervisor is not bundled with this recipe.
+
+### Mixed-load soak: PASS (mixed clocks)
+
+The API stability run requested 600 seconds and finished its last batch at 614.12 seconds. It completed 100 requests in 40 batches: 34 short chat, 33 exact-8K prompts, and 33 decode requests, at concurrency levels one through four. Request/HTTP errors: **0**. No memory-guard abort occurred; minimum host MemAvailable was 5.1361 GiB.
+
+| Clock label | Sample source | SM MHz min/med/max | GPU W min/med/max | GPU C min/med/max |
+|---|---|---:|---:|---:|
+| cap-active-or-mixed | in-phase 1s | 1969 / 2476 / 2574 | 18.11 / 34.725 / 42.12 | 43 / 55 / 61 |
+
+The cap service was inactive on all four nodes before the soak and active on all four afterward. Therefore, this is **not a fullclk soak**. All four samplers stopped cleanly, with 613 in-request samples per rank. The reused prompt pool allowed prefix-cache hits. PASS covers client/API stability, not model quality or the absence of kernel/driver errors.
+
+Record the resolved image digest, full model revision, clock samples, KV pool, date, and network configuration with future measurements. Do not compare different clock settings without stating the difference.
 
 ## Local validation and privacy check
 
