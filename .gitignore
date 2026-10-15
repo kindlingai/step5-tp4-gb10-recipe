@@ -5,3 +5,4 @@ scripts/tokenizer/
 scripts/prompts.json
 receipt*.json
 receipt*.md
+*.requests.jsonl

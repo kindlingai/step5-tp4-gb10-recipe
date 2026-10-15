@@ -154,7 +154,7 @@ python3 scripts/bench.py --go \
   --base http://192.168.50.11:18000/v1 --output receipt.json
 ```
 
-The harness uses one warmup plus three measured requests at each prefill size, then three 512-token decode requests for each of prose, code, and JSON. Each request has a different prefix. Regenerate the prompts before a repeated run to avoid prefix-cache reuse. Decode uses `ignore_eos=true` to request the full length.
+The default `bench` mode uses one warmup plus three measured requests at each prefill size, then three 512-token S1 decode requests for each of prose, code, and JSON, followed by three S4 batches of four concurrent 512-token streams. Each request has a different prefix. Regenerate the prompts before a repeated run to avoid prefix-cache reuse. Decode uses `ignore_eos=true` to request the full length.
 
 - Input sizes are exactly 8192 and 32768 tokens after the pinned chat template. The receipt compares server usage with the local counts.
 - TTFT runs from request start to first nonempty content or reasoning SSE text.
@@ -163,6 +163,26 @@ The harness uses one warmup plus three measured requests at each prefill size, t
 - Per-run MTP acceptance uses accepted/drafted counter deltas from `/metrics`. No other request traffic may occur during these measurements. The default 11-second post-request metrics wait must exceed the server's actual publication interval.
 - Before and after each phase, the harness records current/max SM clocks, temperature, power, and `gpu-clock-cap` service state on all four ranks. `fullclk` requires the service to be inactive on all four at both boundaries. Failed queries produce `unknown`. This label does not claim every sampled clock reaches the hardware maximum.
 - JSON receipts contain operational addresses, clock command output, and raw metrics. Review and redact them before sharing. The privacy scanner is an automated check, not a complete privacy review.
+
+### S4, smoke, and soak modes
+
+```sh
+python3 scripts/bench.py --go --mode s4 --output s4.json
+python3 scripts/bench.py --go --mode smoke --output smoke.json
+python3 scripts/bench.py --go --mode soak --soak-seconds 600 --output soak.json
+```
+
+Set `BENCH_BASE` or pass `--base` for your API address. `--mode s1` retains the original 17-request suite; `--mode bench` is the default and adds 12 S4 requests. Recreate the fixture with the current `prepare.py` before use.
+
+**S4:** three batches, each with prose, code, JSON, and prose streams. All four streams request 512 tokens and start through a thread barrier. Reports include aggregate and individual stream rates. Aggregate decode throughput is `sum(N-1)/(latest last text SSE - earliest first text SSE)`. JSON also records aggregate end-to-end throughput over the batch wall time. Global MTP counters belong to the whole batch, not a single concurrent stream.
+
+**Smoke:** one chat completion asks for the sentence “Two plus two equals four.” PASS requires that sentence after punctuation/case normalization, a nonempty reasoning field, normal stop, and matching prompt usage. The expected answer is a narrow arithmetic/instruction-following sanity check, not a general quality assessment.
+
+**Soak:** the default duration is 600 seconds. Workloads cycle through short chat, an exact-8K prompt, and 512-token decode; concurrency cycles from one to four. The prepared pool is reused, so prefix-cache hits are allowed. No new batches start after the requested duration; the last batch may finish later. `--request-timeout` defaults to 180 seconds and measures socket inactivity, not a strict total wall-time limit.
+
+Every soak request produces a JSONL record in `<output-stem>.requests.jsonl`, with usage, timings, errors, and HTTP failure details. JSON and Markdown contain PASS/FAIL. PASS requires no request errors or warnings, all three workload types, all four concurrency levels, and the full requested duration. This client checks API stability; it does not inspect kernel logs or prove that GPU-driver errors are absent.
+
+All modes retain the explicit `--go` gate. Smoke, S4, and soak failures return a nonzero CLI status. `complete` records whether the mode finished; `passed` records its outcome. Unit tests use short local stub soaks, not a ten-minute live run.
 
 ## Results — placeholders only
 
@@ -173,18 +193,19 @@ The harness uses one warmup plus three measured requests at each prefill size, t
 | Prose, 512 output | pending | — | — | — | — | — |
 | Code, 512 output | pending | — | — | — | — | — |
 | JSON, 512 output | pending | — | — | — | — | — |
+| S4, four × 512 output | pending | — | — | — | — | — |
 
 Record the resolved image digest, complete model revision, measured clock samples, KV-cache pool, run date, and hardware/network configuration alongside any future results. Do not compare rows with different clock settings without stating the difference.
 
 ## Local validation and privacy check
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 tests/test_recipe.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 for script in scripts/*.sh; do bash -n "$script"; done
 scripts/privacy_scan.sh
 ```
 
-The tests use temporary files and a mock container command. They do not contact a cluster. The scan checks working-tree text, relative filenames, and available commit history for private infrastructure details and common credential formats. It includes its own script. Keep local credentials and generated receipts out of a release bundle.
+The tests use temporary files, a mock container command, and a local SSE stub. They test S4 concurrency, smoke failures, and soak HTTP-error logs without contacting a cluster. The scan checks working-tree text, relative filenames, and available commit history for private infrastructure details and common credential formats. It includes its own script. Keep local credentials and generated receipts out of a release bundle.
 
 ## Credits and licenses
 

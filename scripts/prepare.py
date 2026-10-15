@@ -41,12 +41,23 @@ def prepare():
             messages = [{'role':'user','content':uuid.uuid4().hex + '\n' + prompt}]
             cases.append({'phase':f'decode_{kind}', 'rep':rep, 'warmup':False,
                           'prompt_tokens_local':count(messages), 'messages':messages, 'max_tokens':512})
+    def case(kind, prompt, limit, rep=1):
+        messages = [{'role':'user','content':uuid.uuid4().hex + '\n' + prompt}]
+        return {'phase':kind,'rep':rep,'warmup':False,'messages':messages,
+                'prompt_tokens_local':count(messages),'max_tokens':limit}
+    s4_batches = [[case('decode_s4_'+kind,prompts[kind],512,rep)
+                   for kind in ('prose','code','json','prose')] for rep in range(1,4)]
+    smoke_case = case('smoke', 'What is two plus two? Answer with exactly this sentence: Two plus two equals four.',512)
+    smoke_case['allow_early_stop'] = True
+    soak_short = case('soak_short','Explain in one short sentence why clean drinking water matters.',64)
+    soak_short['allow_early_stop'] = True
     fixture = {'model':'step5','tokenizer_revision':REV,
                'source':'https://huggingface.co/stepfun-ai/Step-5-Preview-NVFP4/tree/'+REV,
                'tokenizer_sha256':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((ROOT/'tokenizer').iterdir())},
-               'cases':cases}
+               'cases':cases,'s4_batches':s4_batches,'smoke_case':smoke_case,
+               'soak_cases':[soak_short,cases[1],next(c for c in cases if c['phase']=='decode_prose')]}
     (ROOT/'prompts.json').write_text(json.dumps(fixture,indent=2)+'\n')
-    print('Prepared',len(cases),'requests;',[(x['phase'],x['rep'],x['prompt_tokens_local']) for x in cases])
+    print('Prepared 12 S4 requests, 1 smoke case, and 3 soak cases; plus',len(cases),'S1/prefill requests;',[(x['phase'],x['rep'],x['prompt_tokens_local']) for x in cases])
     return fixture
 
 if __name__ == '__main__': prepare()
