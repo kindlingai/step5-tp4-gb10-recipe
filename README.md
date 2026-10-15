@@ -300,7 +300,7 @@ Record the resolved image digest, full model revision, clock samples, KV pool, d
 | S1 decode | Approximately 25–30 tok/s | Not reported in source table | Not reported in source table |
 | S4 decode | Code 66.5 tok/s aggregate; prose 40.3 tok/s aggregate | Not reported in source table | Not reported in source table |
 
-Source: [upstream measured section](https://github.com/0xSero/Step-5-Preview-Four-Sparks/blob/main/README.md#measured), checked 2026-10-15. That recipe uses a different EXL3 hybrid checkpoint, FP16 KV, MTP2, RoCEnante all-reduce, and 262144 context. Its decode runs stop naturally; ours use fixed 512-token outputs. These are comparison references, not matched benchmarks or evidence of a speed advantage.
+Source: [upstream measured section](https://github.com/0xSero/Step-5-Preview-Four-Sparks/blob/main/README.md#measured), checked 2026-10-15. That recipe uses a different EXL3 mixed-format checkpoint, FP16 KV, MTP2, RoCEnante all-reduce, and 262144 context. Its decode runs stop naturally; ours use fixed 512-token outputs. These are comparison references, not matched benchmarks or evidence of a speed advantage.
 
 We did **not** adopt that recipe's NCCL tuning settings for these runs. No claim is made that those settings were tested here.
 
