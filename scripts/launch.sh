@@ -35,7 +35,7 @@ docker run -d --name "$NAME" --gpus all --ipc=host --network=host --shm-size 16g
   --served-model-name step5 --host 0.0.0.0 --port "${API_PORT:-18000}" \
   --tensor-parallel-size 4 --nnodes 4 --node-rank "$R" --master-addr "$NODE0" --master-port "${MASTER_PORT:-29511}" \
   --distributed-executor-backend mp --disable-custom-all-reduce \
-  --max-model-len "${MAXLEN:-65536}" --max-num-batched-tokens "${BATCH_TOKENS:-4096}" --max-num-seqs "${MAXSEQ:-8}" \
+  --max-model-len "${MAXLEN:-131072}" --max-num-batched-tokens "${BATCH_TOKENS:-4096}" --max-num-seqs "${MAXSEQ:-8}" \
   --gpu-memory-utilization "${GMU:-0.85}" --enable-prefix-caching --kv-cache-dtype "${KV_DTYPE:-auto}" \
   --trust-remote-code "${SPEC_ARGS[@]}" \
   --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5 "${DENSE_ARGS[@]}" "${LM_ARGS[@]}" "$@"

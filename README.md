@@ -2,7 +2,7 @@
 
 A recipe skeleton for `stepfun-ai/Step-5-Preview-NVFP4` with vLLM tensor parallelism across four NVIDIA DGX Spark systems (GB10).
 
-**Configuration:** dense attention (DSA kernels need SM90/SM103 in this vLLM image), BF16 KV via `auto`, text-only, MTP3, 65536-token context.
+**Configuration:** dense attention (DSA kernels need SM90/SM103 in this vLLM image), BF16 KV via `auto`, text-only, MTP3, 131072-token context (65536-token alternative).
 
 **Status:** The configuration below has measured benchmark and API-soak results on four systems. The generalized launch and NFS scripts are CPU-tested; those generalized scripts have not been validated end to end on a live cluster.
 
@@ -112,7 +112,7 @@ Default vLLM configuration:
 ```text
 --tensor-parallel-size 4 --nnodes 4
 --distributed-executor-backend mp --disable-custom-all-reduce
---max-model-len 65536 --max-num-batched-tokens 4096 --max-num-seqs 8
+--max-model-len 131072 --max-num-batched-tokens 4096 --max-num-seqs 8
 --gpu-memory-utilization 0.85
 --enable-prefix-caching --kv-cache-dtype auto
 --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5
@@ -131,7 +131,7 @@ The current configuration is **dense attention (DSA kernels need SM90/SM103 in t
 {"text_config":{"sparse_config":{"enabled":false}}}
 ```
 
-This changes attention behavior. No quality-equivalence claim is made for dense versus sparse attention, and this draft reports no measured quality result. `STEP5_DENSE=1` enables the override by default.
+This changes attention behavior. No quality-equivalence claim is made for dense versus sparse attention, and the single needle-recall check below is not a general quality evaluation. `STEP5_DENSE=1` enables the override by default.
 
 The FA2 path on SM121 in this image does not support FP8 KV. Therefore, `KV_DTYPE=auto` selects the model's BF16 KV dtype rather than FP8. This is a KV-cache choice; the checkpoint remains NVFP4. It is not a claim that all attention backends on SM121 lack FP8 KV support.
 
@@ -141,7 +141,7 @@ For comparison, the separate [0xSero four-Spark recipe README](https://github.co
 
 `SPEC_TOKENS=3` is the default. Set `SPEC_TOKENS=0` to omit speculative arguments for a separate non-MTP configuration. Extra vLLM arguments may follow the rank. No optional MoE overlay is included in this baseline.
 
-The launcher refuses to replace an existing container with the same name. Inspect logs and stop/remove old containers explicitly before another launch. Verify image identity, model readiness, memory allocation, and the actual KV-cache token pool before recording results. This configuration requests `--kv-cache-dtype auto`, which uses BF16 KV for this model. The measured run reported a KV pool of 156,294 tokens, with 4.71 GiB allocated per rank. Verify capacity again after any configuration change.
+The launcher refuses to replace an existing container with the same name. Inspect logs and stop/remove old containers explicitly before another launch. Verify image identity, model readiness, memory allocation, and the actual KV-cache token pool before recording results. This configuration requests `--kv-cache-dtype auto`, which uses BF16 KV for this model. The 128K profile reported a KV pool of 202,818 tokens (4.23 GiB observed on rank 0); the 64K profile reported 156,294 tokens (4.71 GiB per rank). Set `MAXLEN=65536` in your configuration for the 64K alternative; the default is `MAXLEN=131072`. Verify capacity again after any configuration change.
 
 ### Boot-time page-cache workaround
 
@@ -231,9 +231,11 @@ Every soak request produces a JSONL record in `<output-stem>.requests.jsonl`, wi
 
 All modes retain the explicit `--go` gate. Smoke, S4, and soak failures return a nonzero CLI status. `complete` records whether the mode finished; `passed` records its outcome. Unit tests use short local stub soaks, not a ten-minute live run.
 
-## Measured results — 64K context, MTP3
+## Measured results: two profiles
 
-Measured on 2026-10-15 with the pinned model above, four GB10 systems, dense attention, BF16 KV, memory utilization 0.85, and a 4096-token batch limit. All benchmark requests passed without client warnings or memory-guard aborts. The measured configuration stays at 65536 context; no 128K result is claimed here. The resolved image digest and exact fabric hardware are not included in this result summary.
+### b2 — 64K context, MTP3, fullclk
+
+Measured on 2026-10-15 with the pinned model above, four GB10 systems, dense attention, BF16 KV, memory utilization 0.85, and a 4096-token batch limit. All benchmark requests passed without client warnings or memory-guard aborts. This b2 profile used 65536 context and a 156,294-token KV pool. Its benchmark run was `b2-20261015T201632Z`. The resolved image digest and exact fabric hardware are not included in this result summary.
 
 Rates and TTFT are medians of three measured repetitions. Clock and power values are min/median/max across all four nodes in the measured request windows. Each row uses one-second in-phase telemetry. `fullclk` means the clock-cap service was inactive on every node at both phase boundaries, not that every sample reached maximum clock.
 
@@ -248,7 +250,7 @@ Rates and TTFT are medians of three measured repetitions. Clock and power values
 
 S4 aggregate rates were 58.49, 62.51, and 60.89 tok/s. The per-stream figure is the median of all 12 streams. MTP ratios pool the accepted/drafted deltas across each row's runs. One-token prefill requests produced no MTP drafts. Minimum observed host MemAvailable was 5.2458 GiB; maximum GPU temperature was 67 C. A separate client supervisor aborted below 4 GiB on any rank; that private supervisor is not bundled with this recipe.
 
-### Mixed-load soak: PASS (mixed clocks)
+#### b2 mixed-load soak: PASS (mixed clocks)
 
 The API stability run requested 600 seconds and finished its last batch at 614.12 seconds. It completed 100 requests in 40 batches: 34 short chat, 33 exact-8K prompts, and 33 decode requests, at concurrency levels one through four. Request/HTTP errors: **0**. No memory-guard abort occurred; minimum host MemAvailable was 5.1361 GiB.
 
@@ -258,7 +260,49 @@ The API stability run requested 600 seconds and finished its last batch at 614.1
 
 The cap service was inactive on all four nodes before the soak and active on all four afterward. Therefore, this is **not a fullclk soak**. All four samplers stopped cleanly, with 613 in-request samples per rank. The reused prompt pool allowed prefix-cache hits. PASS covers client/API stability, not model quality or the absence of kernel/driver errors.
 
+
+### b3 — 128K context, MTP3, clk2000 (default)
+
+Measured on 2026-10-15, run `b3-20261015T205109Z`. The configured context is 131072; the reported KV pool is 202,818 tokens, with 4.23 GiB observed on rank 0. Other settings match b2: dense attention, BF16 KV, MTP3, memory utilization 0.85, batch limit 4096, and language-model-only.
+
+Smoke and all 29 benchmark requests passed with matching token counts and no client warnings. The 4 GiB memory guard did not abort. Minimum host MemAvailable was 4.5166 GiB; maximum sampled GPU temperature was 55 C. Every phase had clean four-node sampler cleanup. `clk2000` records the externally reported 2000 MHz target; all four cap services were active before and after each phase. The harness did not independently read the configured cap value.
+
+| Phase | Clock label | Sample source | SM MHz min/med/max | GPU W min/med/max | TTFT median (s) | Prefill proxy (tok/s) | Decode (tok/s) | MTP accepted/drafted |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| 8K prefill | clk2000 | in-phase 1s | 1969 / 1982 / 1989 | 8.3 / 23.9 / 25.5 | 7.18 | 1141.46 | — | N/A |
+| 32K prefill | clk2000 | in-phase 1s | 1969 / 1982 / 1995 | 7.7 / 26.5 / 29.4 | 30.53 | 1073.19 | — | N/A |
+| S1 prose, 512 output | clk2000 | in-phase 1s | 1969 / 1982 / 1995 | 7.8 / 18.1 / 19.4 | 0.68 | — | 27.09 | 966 / 1704 (56.7%) |
+| S1 code, 512 output | clk2000 | in-phase 1s | 1976 / 1982 / 1995 | 7.8 / 18.2 / 19.5 | 0.40 | — | 28.91 | 993 / 1620 (61.3%) |
+| S1 JSON, 512 output | clk2000 | in-phase 1s | 1976 / 1982 / 1995 | 7.7 / 18.2 / 19.6 | 0.40 | — | 28.55 | 997 / 1629 (61.2%) |
+| S4, four × 512 output | clk2000 | in-phase 1s | 1969 / 1982 / 1995 | 8.6 / 21.4 / 23.0 | — | — | 60.30 aggregate; 15.74 per stream | 3902 / 6732 (58.0%) |
+
+S4 aggregate rates were 61.59, 56.98, and 60.30 tok/s; the per-stream figure pools all 12 streams. These are three-repeat medians, using the same measurement definitions as b2. The b2 and b3 clocks differ, so this is not a controlled context-size performance comparison. No b3 soak was run.
+
+#### b3 needle recall: PASS
+
+| Check | Result | Clock label | GPU power |
+|---|---|---|---|
+| Single long-prompt needle recall | Exact inserted passphrase recalled; 111,059 prompt tokens; 132.4 s client wall time | clk2000 (reported for this boot) | Not sampled for this request |
+
+The request and response receipts verify exact recall and server-reported prompt usage. The recorded curl client time was 132.375184 seconds. This proves recall for this one 111,059-token prompt, not general long-context quality or a full 131072-token request. No secret or raw prompt is included here.
+
 Record the resolved image digest, full model revision, clock samples, KV pool, date, and network configuration with future measurements. Do not compare different clock settings without stating the difference.
+
+
+### Prior four-Spark recipe and comparison reference
+
+[0xSero's Step-5-Preview-Four-Sparks](https://github.com/0xSero/Step-5-Preview-Four-Sparks) is a prior four-Spark recipe and our comparison reference. Its README reports the following results; these are upstream measurements, not measurements from this recipe.
+
+| Upstream metric | Reported result | Clock label | GPU power |
+|---|---|---|---|
+| 8K prefill | 1,106–1,327 tok/s cold; 1,365–1,565 tok/s warm | Not reported in source table | Not reported in source table |
+| 32K prefill | 1,445 tok/s, one launch | Not reported in source table | Not reported in source table |
+| S1 decode | Approximately 25–30 tok/s | Not reported in source table | Not reported in source table |
+| S4 decode | Code 66.5 tok/s aggregate; prose 40.3 tok/s aggregate | Not reported in source table | Not reported in source table |
+
+Source: [upstream measured section](https://github.com/0xSero/Step-5-Preview-Four-Sparks/blob/main/README.md#measured), checked 2026-10-15. That recipe uses a different EXL3 hybrid checkpoint, FP16 KV, MTP2, RoCEnante all-reduce, and 262144 context. Its decode runs stop naturally; ours use fixed 512-token outputs. These are comparison references, not matched benchmarks or evidence of a speed advantage.
+
+We did **not** adopt that recipe's NCCL tuning settings for these runs. No claim is made that those settings were tested here.
 
 ## Local validation and privacy check
 
@@ -271,6 +315,8 @@ scripts/privacy_scan.sh
 The tests use temporary files, a mock container command, and a local SSE stub. They test S4 concurrency, smoke failures, and soak HTTP-error logs without contacting a cluster. The scan checks working-tree text, relative filenames, and available commit history for private infrastructure details and common credential formats. It includes its own script. Keep local credentials and generated receipts out of a release bundle.
 
 ## Credits and licenses
+
+- [0xSero Step-5-Preview-Four-Sparks](https://github.com/0xSero/Step-5-Preview-Four-Sparks): prior four-Spark deployment recipe and comparison reference. Its NCCL tuning settings were not used for these measurements.
 
 - [StepFun model and model card](https://huggingface.co/stepfun-ai/Step-5-Preview-NVFP4): model, tokenizer, and model documentation. The deployment image supplied for this model is `vllm/vllm-openai:step-5-preview`.
 - [vLLM documentation](https://docs.vllm.ai/): inference engine, distributed execution, OpenAI-compatible API, and speculative-decoding metrics.

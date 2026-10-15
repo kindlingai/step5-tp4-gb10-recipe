@@ -48,12 +48,13 @@ class RecipeTests(unittest.TestCase):
             mock.write_text('#!/usr/bin/env python3\nimport json,os,sys\nif sys.argv[1:3]==["container","inspect"]:sys.exit(1)\nwith open(os.environ["MOCK_LOG"],"a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")\nprint("mock-container")\n')
             mock.chmod(0o755)
             env={**os.environ,'STEP5_CONFIG':'','STEP5_ROOT':str(storage),'CACHE_DIR':str(base/'cache'),'PATH':str(base)+os.pathsep+os.environ['PATH'],'MOCK_LOG':str(base/'calls'),'GMU':'0.85','BATCH_TOKENS':'4096','KV_DTYPE':'auto','STEP5_DENSE':'1','LMONLY':'1','SPEC_TOKENS':'3','DROP_PAGE_CACHE':'0'}
+            env.pop('MAXLEN',None)
             for rank in range(4):
                 p=shell('launch.sh',rank,env=env);self.assertEqual(p.returncode,0,p.stderr)
             calls=[json.loads(x) for x in (base/'calls').read_text().splitlines()]
             self.assertEqual(len(calls),4)
             for rank,call in enumerate(calls):
-                for flag,value in [('--kv-cache-dtype','auto'),('--gpu-memory-utilization','0.85'),('--max-num-batched-tokens','4096'),('--tensor-parallel-size','4'),('--nnodes','4'),('--node-rank',str(rank))]:
+                for flag,value in [('--max-model-len','131072'),('--kv-cache-dtype','auto'),('--gpu-memory-utilization','0.85'),('--max-num-batched-tokens','4096'),('--tensor-parallel-size','4'),('--nnodes','4'),('--node-rank',str(rank))]:
                     self.assertEqual(call[call.index(flag)+1],value)
                 self.assertEqual('--headless' in call,rank!=0)
                 self.assertIn('--language-model-only',call)
@@ -61,6 +62,11 @@ class RecipeTests(unittest.TestCase):
                 self.assertEqual(call[call.index('--spec-tokens')+1],'3')
                 self.assertEqual(json.loads(call[call.index('--hf-overrides')+1]),{'text_config':{'sparse_config':{'enabled':False}}})
                 self.assertIn(f'type=bind,source={storage},target={storage},readonly',call)
+            env['MAXLEN']='65536'
+            p=shell('launch.sh',0,env=env);self.assertEqual(p.returncode,0,p.stderr)
+            alternate=json.loads((base/'calls').read_text().splitlines()[-1])
+            self.assertEqual(alternate[alternate.index('--max-model-len')+1],'65536')
+            self.assertIn('MAXLEN=131072',(REPO/'env.example').read_text().splitlines())
             p=shell('launch.sh',4,env=env);self.assertNotEqual(p.returncode,0)
     def test_page_cache_loop_dry_run(self):
         p=shell('drop-page-cache.sh','--dry-run')
