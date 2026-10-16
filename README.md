@@ -1,5 +1,7 @@
 # Step-5 Preview NVFP4 on four DGX Spark systems
 
+> **Note:** This is not a fully optimized recipe. It is meant to speed up testing from scratch.
+
 A recipe skeleton for `stepfun-ai/Step-5-Preview-NVFP4` with vLLM tensor parallelism across four NVIDIA DGX Spark systems (GB10).
 
 **Default path:** staged FP8 KV (dense attention, SM121), FP8 E4M3 cache, block size 16, MTP3, text-only, and dual-rail NCCL with two channels. **Default b5-fp8: 576K window (589,824 tokens), 40000 blocks, GMU 0.86, and `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`. The cold 575K needle passed.** The 192K BF16/MTP3 profile is the safe option. The 256K BF16 and 442368-token FP8 profiles remain additional safer options.
@@ -309,6 +311,18 @@ Set `BENCH_BASE` or pass `--base` for your API address. `--mode s1` retains the 
 Every soak request produces a JSONL record in `<output-stem>.requests.jsonl`, with usage, timings, errors, and HTTP failure details. JSON and Markdown contain PASS/FAIL. PASS requires no request errors or warnings, all three workload types, all four concurrency levels, and the full requested duration. This client checks API stability; it does not inspect kernel logs or prove that GPU-driver errors are absent.
 
 All modes retain the explicit `--go` gate. Smoke, S4, and soak failures return a nonzero CLI status. `complete` records whether the mode finished; `passed` records its outcome. Unit tests use short local stub soaks, not a ten-minute live run.
+
+## Decode speed versus context depth
+
+Single-stream decode slows down as the context grows. The vLLM Triton/FA2 attention path used for MTP verify does not split long contexts across the GPU on GB10, so each verify step scans the whole context with few thread blocks. Without MTP, decode is slower at short context but flatter, and it is faster than MTP3 past about 50K tokens.
+
+| profile | 0 | 8K | 16K | 32K | 48K | 64K |
+|---|---:|---:|---:|---:|---:|---:|
+| b5-fp8 (default), MTP3, FP8 KV | 23.2 | 20.2 | 17.4 | 14.0 | 12.7 | 10.4 |
+| b5-fp8, MTP off, FP8 KV | 13.8 | — | 12.6 | 12.2 | — | 11.5 |
+| stock BF16 KV (FA2), MTP3 | 22.7 | — | 18.7 | 16.2 | — | 12.3 |
+
+Decode tok/s, one stream, 512 generated tokens after a prompt of the given depth, n=1 per cell, GPU clocks capped at 2000 MHz. A dash means not measured.
 
 ## Measured results: current profile and history
 
