@@ -1,0 +1,15 @@
+--- a/scripts/launch.sh
++++ b/scripts/launch.sh
+@@ -28,2 +28,3 @@
+ SPEC_ARGS=(); if (( ${SPEC_TOKENS:-3} > 0 )); then SPEC_ARGS=(--spec-method mtp --spec-tokens "${SPEC_TOKENS:-3}"); fi
++source "$RECIPE_DIR/fp8-kv/integration/launch.fragment.sh"
+ docker run -d --name "$NAME" --gpus all --ipc=host --network=host --shm-size 16g \
+@@ -37,2 +38,3 @@
+   -e "NCCL_MIN_NCHANNELS=${NCCL_MIN_NCHANNELS:-2}" -e "NCCL_MAX_NCHANNELS=${NCCL_MAX_NCHANNELS:-2}" \
++  "${FP8KV_ARGS[@]}" \
+   --entrypoint vllm "$IMAGE" serve "$MODEL_DIR" "${HEAD_ARGS[@]}" \
+@@ -44,3 +46,3 @@
+   --trust-remote-code "${SPEC_ARGS[@]}" \
+-  --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5 "${DENSE_ARGS[@]}" "${LM_ARGS[@]}" "$@"
++  --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5 "${DENSE_ARGS[@]}" "${LM_ARGS[@]}" "${FP8KV_VLLM_ARGS[@]}" "$@"
+ if [[ ${DROP_PAGE_CACHE:-1} == 1 ]]; then

@@ -2,9 +2,9 @@
 
 A recipe skeleton for `stepfun-ai/Step-5-Preview-NVFP4` with vLLM tensor parallelism across four NVIDIA DGX Spark systems (GB10).
 
-**Configuration:** dense attention (DSA kernels need SM90/SM103 in this vLLM image), BF16 KV via `auto`, text-only, MTP3, 196608-token (192K) context, dual-rail NCCL with two channels. Historical 128K and 64K results remain below.
+**Default path:** staged FP8 KV (dense attention, SM121), FP8 E4M3 cache, block size 16, MTP3, text-only, and dual-rail NCCL with two channels. **Default b5-fp8: 576K window (589,824 tokens), 40000 blocks, GMU 0.86, and `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`. The cold 575K needle passed.** The 192K BF16/MTP3 profile is the safe option. The 256K BF16 and 442368-token FP8 profiles remain additional safer options.
 
-**Status:** The configuration below has measured benchmark and API-soak results on four systems. The generalized launch and NFS scripts are CPU-tested; those generalized scripts have not been validated end to end on a live cluster.
+**Status:** The default 576K profile has smoke and S1/S4 benchmark results, plus exact recall on one cold 575,000-token needle. No b5 soak was run. Limited numerical diagnostics against BF16 were measured on the earlier 442368-token FP8 profile with the same overlay kernels. Historical results remain below. The generalized launch and NFS scripts are CPU-tested, not validated end to end on a live cluster.
 
 ## Hardware and software
 
@@ -52,6 +52,56 @@ cp env.example config.env
 # Edit config.env before continuing.
 export STEP5_CONFIG="$PWD/config.env"
 ```
+
+### Select a profile in config.env
+
+The root configuration enables `STEP5_FP8KV=1` and `KV_DTYPE=fp8_e4m3`.
+It contains the b5 **576K default profile**. The launcher
+still requires explicit `MAXLEN`, `FP8KV_BLOCKS`, and `GMU` values. Choose the
+graph-budget flag with the profile; the default uses `0`, the safer options `1`.
+
+| Profile | MAXLEN | GMU | FP8KV_BLOCKS | Graph estimate flag | Status |
+|---|---:|---:|---:|---:|---|
+| b5-fp8 576K default | 589824 | 0.86 | 40000 | 0 | Smoke and benchmark PASS; cold 575K needle PASS |
+| Safer FP8 configuration | 442368 | 0.85 | 30000 | 1 | Smoke and benchmark measured; 430K cached needle PASS; no cold prefill time |
+| BF16 192K safe option | 196608 | 0.85 | Not used | 1 | MTP3; benchmark and 190K needle PASS |
+| BF16 256K alternative | 262144 | 0.86 | Not used | 1 | MTP3; 250K needle PASS; **not benchmarked** |
+
+The graph estimate flag column means `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS`.
+For the safer 442368-token FP8 option, set all of these in `config.env`:
+
+```sh
+STEP5_FP8KV=1
+KV_DTYPE=fp8_e4m3
+MAXLEN=442368
+FP8KV_BLOCKS=30000
+GMU=0.85
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1
+SPEC_TOKENS=3
+```
+
+For the 192K BF16 option, set all of these in `config.env`:
+
+```sh
+STEP5_FP8KV=0
+KV_DTYPE=auto
+MAXLEN=196608
+GMU=0.85
+FP8KV_BLOCKS=
+VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1
+SPEC_TOKENS=3
+```
+
+For the 256K BF16 option, use the same values except `MAXLEN=262144` and
+`GMU=0.86`. Both retain dense attention, the 4096-token batch limit, and
+dual-rail C2. Disabling the hook alone while retaining FP8 KV arguments is not
+a BF16 rollback. No block override is passed for the BF16 options.
+
+The vendored [overlay documentation](fp8-kv/README.md) includes a standalone
+30000-block example. That example is **not** the final release selection.
+The root launcher already includes the integration; do not reapply its example
+launcher patch. Copy the complete `fp8-kv/` directory to the same recipe location
+on every rank. An empty `FP8KV_DIR` uses this recipe's `fp8-kv/overlay` path.
 
 Download the complete pinned model on a staging machine with enough space. For example, with the Hugging Face CLI already installed:
 
@@ -107,14 +157,15 @@ scripts/launch.sh 3  # on rank 3
 scripts/launch.sh 0  # on rank 0
 ```
 
-Default vLLM configuration:
+Default b5-fp8 vLLM configuration: 576K window (589,824 tokens):
 
 ```text
 --tensor-parallel-size 4 --nnodes 4
 --distributed-executor-backend mp --disable-custom-all-reduce
---max-model-len 196608 --max-num-batched-tokens 4096 --max-num-seqs 8
---gpu-memory-utilization 0.85
---enable-prefix-caching --kv-cache-dtype auto
+--max-model-len 589824 --max-num-batched-tokens 4096 --max-num-seqs 8
+--gpu-memory-utilization 0.86
+--enable-prefix-caching --kv-cache-dtype fp8_e4m3
+--block-size 16 --num-gpu-blocks-override 40000
 --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5
 --trust-remote-code --language-model-only
 --spec-method mtp --spec-tokens 3
@@ -144,15 +195,32 @@ The current configuration is **dense attention (DSA kernels need SM90/SM103 in t
 
 This changes attention behavior. No quality-equivalence claim is made for dense versus sparse attention, and the single needle-recall check below is not a general quality evaluation. `STEP5_DENSE=1` enables the override by default.
 
-The FA2 path on SM121 in this image does not support FP8 KV. Therefore, `KV_DTYPE=auto` selects the model's BF16 KV dtype rather than FP8. This is a KV-cache choice; the checkpoint remains NVFP4. It is not a claim that all attention backends on SM121 lack FP8 KV support.
+The stock FA2 path on SM121 in this image does not support FP8 KV. The bundled
+overlay supplies **staged FP8 KV (dense attention, SM121)** instead: FP8 E4M3
+persistent cache, BF16 queries/outputs, and block size 16. Small query batches
+use Triton attention; larger batches convert live KV pages into retained BF16
+scratch before FA2 attention. This is not native FP8 FA2 or FlashInfer attention.
+The checkpoint weights remain NVFP4.
+
+The launcher mounts the overlay read-only, sets `STEP5_FP8KV=1`, adds it to
+container `PYTHONPATH`, verifies its six-file SHA256 manifest, and passes
+`--block-size 16 --num-gpu-blocks-override "$FP8KV_BLOCKS"`. The hook checks the
+pinned model-source hash and changes backend selection in memory; it does not
+edit the image. Retained BF16 scratch also consumes memory. A larger block cap
+must budget for scratch and workspace, not only FP8 storage. See
+[capacity limits and unsupported paths](fp8-kv/README.md#capacity-and-limitations).
+
+The BF16 options use `STEP5_FP8KV=0` and `KV_DTYPE=auto` (BF16 for this model),
+without the overlay mount or block override. They remain available without
+claiming FP8 is numerically identical to BF16.
 
 For comparison, the separate [0xSero four-Spark recipe README](https://github.com/0xSero/Step-5-Preview-Four-Sparks/blob/main/README.md#configuration), checked on 2026-10-15, specifies **FP16 KV** matching its FP16 model dtype. It is not an FP8-KV recipe. Its configuration is different; no performance or quality equivalence is implied.
 
-`LMONLY=1` enables `--language-model-only` by default, so this recipe serves text and does not load the vision encoder. The current defaults are memory utilization 0.85, a 4096-token batch limit, and three MTP draft tokens. The environment example and launcher use the same defaults.
+`LMONLY=1` enables `--language-model-only` by default, so this recipe serves text and does not load the vision encoder. The defaults retain a 4096-token batch limit and three MTP draft tokens. The default uses GMU 0.86; the safer profiles use the settings listed above.
 
 `SPEC_TOKENS=3` is the default. Set `SPEC_TOKENS=0` to omit speculative arguments for a separate non-MTP configuration. Extra vLLM arguments may follow the rank. No optional MoE overlay is included in this baseline.
 
-The launcher refuses to replace an existing container with the same name. Inspect logs and stop/remove old containers explicitly before another launch. Verify image identity, model readiness, memory allocation, and the actual KV-cache token pool before recording results. This configuration requests `--kv-cache-dtype auto`, which uses BF16 KV for this model. The default 192K profile reported a KV pool of 258,523 tokens (1.31× capacity at 196608 tokens; allocation GiB not recorded here). Historical 128K reported 202,818 tokens (4.23 GiB observed on rank 0); 64K reported 156,294 tokens (4.71 GiB per rank). The launch default is `MAXLEN=196608`. Set `MAXLEN=131072` or `65536` to request a smaller window, but changing context alone does not reproduce the historical single-rail configurations. Verify capacity again after any configuration change.
+The launcher refuses to replace an existing container with the same name. Inspect logs and stop/remove old containers explicitly before another launch. Verify image identity, model readiness, memory allocation, and the actual KV-cache token pool before recording results. The measured 30000-block FP8 configuration reported a 444,739-token pool; do not reuse that pool value for b5. The b5 boot log records 604,080 tokens; its cold 575K needle passed. BF16 192K reported 258,523 tokens; BF16 256K reported 340,197 tokens. Historical 128K reported 202,818 tokens (4.23 GiB observed on rank 0); 64K reported 156,294 tokens (4.71 GiB per rank). Changing context alone does not reproduce historical network or cache settings. Verify capacity again after any configuration change.
 
 ### Boot-time page-cache workaround
 
@@ -244,7 +312,175 @@ All modes retain the explicit `--go` gate. Smoke, S4, and soak failures return a
 
 ## Measured results: current profile and history
 
-### b4 — 192K context, MTP3, clk2000, dual-rail C2 (default)
+### b5-fp8 — default 576K window, benchmark and cold needle PASS
+
+Default settings: MAXLEN 589824, 40000 blocks, GMU 0.86, FP8 E4M3,
+block size 16, MTP3, batch limit 4096, maximum sequences 8, dense attention,
+and dual-rail C2. It uses the same staged overlay payload as b4-fp8.
+
+| Check | Saved receipt result | Clock label | GPU power |
+|---|---|---|---|
+| KV pool | 604,080 tokens | clk2000 | Not recorded here |
+| Actual captured CUDA graphs | 0.51 GiB on rank 0 | clk2000 | Not recorded here |
+| Host MemAvailable during 575K prefill | 8–9 GiB per rank, integer-resolution snapshot at 00:10:25 UTC on 2026-10-16 | clk2000 | Not recorded here |
+| API smoke | PASS: 17 × 23 returned 391 | clk2000 | Not recorded here |
+| Cold 575K needle | PASS: exact answer, zero prefix-cache hits | clk2000 | Not recorded here |
+
+The saved rank-0 container inspection confirms the profile arguments. Separate
+live container-inspection receipts confirm
+`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` on all four ranks.
+The memory snapshot covers all four ranks, but is not a continuous minimum.
+The separate benchmark and cold-needle results follow below.
+
+The launcher passes the stock vLLM environment variable
+`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` into every b5 container. This stops
+the memory profiler from subtracting an estimated CUDA-graph size from the KV
+budget. It does **not** disable CUDA-graph capture or remove actual graph memory.
+The prior boot estimates were about 1.4–1.9 GiB; the saved b5 rank-0 log records
+1.87 GiB during profiling and 0.51 GiB for the final graph capture. These are different observations, not proof that this flag alone
+reduced physical memory use. Actual graphs, scratch, and workspace still need
+memory. The safer profiles explicitly restore the stock estimate flag to `1`.
+
+
+#### b5 speed measurements on the shipped 576K profile
+
+Measured on 2026-10-16, run `b5-fp8-20261016T002142Z`, with the default settings above.
+Smoke and all 29 benchmark requests passed with matching token counts and no
+client warnings. All seven phases had clean four-node 1 Hz telemetry. The
+4 GiB guard did not abort. Cap services were active on every rank at both
+boundaries of each phase. Minimum host MemAvailable was 8.2220 GiB;
+maximum sampled GPU temperature was 57 C.
+
+| Phase | Clock label | Sample source | SM MHz min/med/max | GPU W min/med/max | TTFT median (s) | Prefill proxy (tok/s) | Decode (tok/s) | MTP accepted/drafted |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| 8K prefill | clk2000 | in-phase 1s | 1969 / 1976 / 1995 | 7.7 / 25.9 / 27.9 | 6.22 | 1317.13 | — | N/A |
+| 32K prefill | clk2000 | in-phase 1s | 1969 / 1989 / 1995 | 8.0 / 28.6 / 31.4 | 26.59 | 1232.33 | — | N/A |
+| S1 prose, 512 output | clk2000 | in-phase 1s | 1969 / 1982 / 1995 | 8.1 / 18.1 / 18.6 | 0.57 | — | 27.24 | 969 / 1695 (57.2%) |
+| S1 code, 512 output | clk2000 | in-phase 1s | 1969 / 1976 / 1989 | 8.4 / 18.2 / 18.7 | 0.34 | — | 27.89 | 991 / 1635 (60.6%) |
+| S1 JSON, 512 output | clk2000 | in-phase 1s | 1969 / 1982 / 1995 | 10.2 / 18.2 / 19.3 | 0.34 | — | 28.40 | 997 / 1620 (61.5%) |
+| S4, four × 512 output | clk2000 | in-phase 1s | 1969 / 1982 / 1995 | 8.0 / 21.5 / 23.7 | — | — | 62.93 aggregate; 16.28 per stream | 3882 / 6780 (57.3%) |
+
+S4 aggregate repeats were **63.66, 60.91, and 62.93 tok/s**. All phase rates
+and TTFT values use three-repeat medians; the per-stream median pools all
+12 streams. Prompt tok/s is input tokens divided by client TTFT, not a
+GPU-kernel-only rate. Decode counts all completion tokens, including reasoning;
+SSE chunk boundaries approximate token times. MTP ratios use settled global
+counter differences in an exclusive client window. No b5 soak was run.
+The speed benchmark reaches 32K input; the cold needle below is a separate test.
+
+#### b5 cold 575K needle recall: PASS
+
+| Check | Result | Clock label | GPU power |
+|---|---|---|---|
+| Single cold needle | PASS: exact answer; 575,000 input tokens; zero prefix-cache hits | clk2000 | Not recorded for this request |
+| TTFT | Approximately 1,267 s, derived from the vLLM TTFT aggregate | clk2000 | Not recorded for this request |
+| Mean long-input prefill proxy | Approximately 454 input tok/s over 575,000 tokens | clk2000 | Not recorded for this request |
+| Client end-to-end wall time | 1,306 s | clk2000 | Not recorded for this request |
+
+The native tokenizer counted exactly **575,000 input tokens**, including the
+chat template. The request used `max_tokens=256` and `temperature=0` on the
+576K default profile. Its answer matched the inserted text exactly, the stream
+ended normally, and the client returned exit code 0. The recorded start/end
+times were 2026-10-15 23:57:16 UTC and 2026-10-16 00:19:02 UTC.
+
+The server metric output captured after completion showed zero prefix-cache
+hits and 575,024 cumulative prompt tokens: the needle plus a 24-token smoke.
+Its TTFT sum was 1,267.9916 s for two requests, including that short smoke.
+Thus **approximately 1,267 s** is aggregate-derived, not a directly timestamped
+client SSE TTFT. The approximately **454 input tok/s** figure is a mean
+input/TTFT proxy, not a decode rate or isolated GPU-kernel measurement.
+The directly recorded 1,306 s wall time includes prefill and answer generation;
+start/end timestamps have one-second resolution.
+
+PASS establishes recall for this single synthetic needle, not general
+long-context quality, the full 589,824-token limit, or concurrent long requests.
+No raw prompt, inserted answer, or private operational receipt is included.
+
+### b4-fp8 — 442368-token FP8 history (same staged overlay kernels)
+
+Measured on 2026-10-15, run `b4-fp8-20261015T232239Z`, using a 442368-token window,
+30000-block override, GMU 0.85, MTP3, and dual-rail C2. The reported KV pool is
+444,739 tokens. These historical rows were measured on the 442368-token profile
+with the same staged overlay kernels, not on the shipped 576K profile. The new
+b5 measurements above are the default-profile speed results.
+
+Smoke and all 29 benchmark requests passed with matching token counts and no
+client warnings. No 4 GiB guard abort occurred. Minimum host MemAvailable was
+10.0592 GiB; maximum sampled GPU temperature was 56 C. All four samplers stopped
+cleanly. Cap services were active on every node before and after each phase.
+
+| Phase | Clock label | Sample source | SM MHz min/med/max | GPU W min/med/max | TTFT median (s) | Prefill proxy (tok/s) | Decode (tok/s) | MTP accepted/drafted |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| 8K prefill | clk2000 | in-phase 1s | 1976 / 1982 / 1989 | 8.3 / 25.6 / 28.0 | 6.20 | 1321.13 | — | N/A |
+| 32K prefill | clk2000 | in-phase 1s | 1969 / 1982 / 1995 | 7.8 / 28.5 / 31.1 | 26.58 | 1232.78 | — | N/A |
+| S1 prose, 512 output | clk2000 | in-phase 1s | 1969 / 1982 / 1995 | 7.9 / 18.0 / 20.0 | 0.31 | — | 28.02 | 977 / 1674 (58.4%) |
+| S1 code, 512 output | clk2000 | in-phase 1s | 1969 / 1982 / 1995 | 7.8 / 18.1 / 20.2 | 0.33 | — | 28.27 | 986 / 1653 (59.6%) |
+| S1 JSON, 512 output | clk2000 | in-phase 1s | 1969 / 1982 / 1995 | 7.9 / 18.0 / 19.7 | 0.33 | — | 28.56 | 1001 / 1599 (62.6%) |
+| S4, four × 512 output | clk2000 | in-phase 1s | 1969 / 1982 / 1989 | 8.5 / 21.4 / 23.0 | — | — | 63.71 aggregate; 16.86 per stream | 3906 / 6708 (58.2%) |
+
+S4 aggregate rates were 58.93, 63.71, and 65.98 tok/s. Rates and TTFT are
+three-repeat medians; the per-stream result pools all 12 streams. No FP8 soak
+was run. Inputs reach 32K only; this table does not establish long-context
+quality or numerical equivalence with BF16. The separate b5 cold-needle result
+is documented above.
+
+#### 430K cached needle recall: PASS on the 442368-token profile
+
+A separate request contained exactly 430,000 native-tokenizer input tokens,
+including the chat template. It used `max_tokens=256`, `temperature=0`, MTP3,
+FP8 E4M3, a 30000-block cap, GMU 0.85, dense attention, C2, and clk2000.
+The answer matched the inserted text exactly and the stream ended normally.
+The successful retry used the prefix cache after an interrupted first attempt.
+**Cold prefill time was not measured.** This cached answer is not a cold-prefill
+speed result, a b5 result, or proof of general long-context quality.
+
+#### FP8 versus BF16 numerical diagnostics
+
+These are diagnostic fixtures, not a general quality or task-accuracy guarantee.
+Top-1 agreement compares the two variants' predicted tokens; it is not correctness
+against a benchmark answer. The short samples contain only 69, 79, and 71 positions.
+
+| Fixture | Scored positions | Top-1 agreement | Clock label | GPU power |
+|---|---:|---:|---|---|
+| 8K prompt | 8,181 | 99.84% | clk2000 (reported) | Not recorded |
+| 32K prompt | 32,757 | 99.98% | clk2000 (reported) | Not recorded |
+| Short prose | 69 | 94.2% | clk2000 (reported) | Not recorded |
+| Short code | 79 | 98.7% | clk2000 (reported) | Not recorded |
+| Short JSON | 71 | 93.0% | clk2000 (reported) | Not recorded |
+
+Across **41,157 scored positions**, the token-weighted mean NLL change
+(FP8 minus BF16) was **-0.0001** (unrounded -0.00012046). Pooling is dominated
+by the long fixtures; it does not remove the observed short-sample differences.
+
+Separate short diagnostic decode runs produced the following MTP acceptance.
+These are not the acceptance values from the three-repeat speed table above.
+
+| Diagnostic case | FP8 accepted/drafted | BF16 accepted/drafted | Clock label | GPU power |
+|---|---:|---:|---|---|
+| Prose | 162 / 285 (56.8%) | 164 / 273 (60.1%) | clk2000 (reported) | Not recorded |
+| Code | 166 / 276 (60.1%) | 167 / 270 (61.9%) | clk2000 (reported) | Not recorded |
+| JSON | 163 / 276 (59.1%) | 163 / 276 (59.1%) | clk2000 (reported) | Not recorded |
+
+Global MTP counter attribution requires an exclusive request window and settled
+metrics. These numerical checks do not establish long-context quality.
+
+### b4-256 — 256K BF16/MTP3 alternative (not benchmarked)
+
+This option uses `MAXLEN=262144`, GMU 0.86, BF16 KV, MTP3, dense attention,
+batch4096, and dual-rail C2. The recorded pool is **340,197 tokens**; the original
+KV log is no longer available, so this is retained as an operator-reported value.
+No 8K/32K prefill, S1, or S4 benchmark was taken for this option.
+
+| Check | Result | Clock label | GPU power |
+|---|---|---|---|
+| Single 250K needle | PASS: exact answer; 250,000 native-tokenizer input tokens; 353 s end-to-end | clk2000 (boot-reported) | Not recorded for this request |
+
+The request used `max_tokens=256` and `temperature=0`. The request hash,
+expected-answer comparison, normal streamed stop, exit status, and wall time
+were checked. This is one synthetic recall case, not broad quality proof or a
+full 262144-token request. The 192K BF16 option and its 190K needle follow.
+
+### b4 — 192K BF16 option, MTP3, clk2000, dual-rail C2
 
 Measured on 2026-10-15, run `b4-20261015T223410Z`, with an exclusive server window.
 The API listing confirms a 196608-token configured context. The reported KV pool is
@@ -373,13 +609,17 @@ We did **not** adopt that recipe's NCCL tuning settings for these runs. No claim
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
-for script in scripts/*.sh; do bash -n "$script"; done
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s fp8-kv/tests -v
+for script in scripts/*.sh fp8-kv/integration/*.sh fp8-kv/scripts/*.sh; do bash -n "$script"; done
+(cd fp8-kv && sha256sum -c overlay.sha256)
 scripts/privacy_scan.sh
 ```
 
-The tests use temporary files, a mock container command, and a local SSE stub. They test S4 concurrency, smoke failures, and soak HTTP-error logs without contacting a cluster. The scan checks working-tree text, relative filenames, and available commit history for private infrastructure details and common credential formats. It includes its own script. Keep local credentials and generated receipts out of a release bundle.
+The tests use temporary files, a mock container command, mocked overlay imports, and a local SSE stub. FP8 command tests cover the default and safer window/block/GMU tuples, including graph-budget flag propagation on all four ranks; BF16 tests cover 192K and 256K options. They test S4 concurrency, smoke failures, and soak HTTP-error logs without contacting a cluster. The scan checks working-tree text, relative filenames, and available commit history for private infrastructure details and common credential formats. It includes its own script. Keep local credentials and generated receipts out of a release bundle.
 
 ## Credits and licenses
+
+The staged FP8 overlay is vendored from public-ready export commit `38b5249`; its README, license, tests, and six-file hash manifest are included under `fp8-kv/`. The README wording was adjusted; the six-file overlay payload and its hashes are unchanged.
 
 - [0xSero Step-5-Preview-Four-Sparks](https://github.com/0xSero/Step-5-Preview-Four-Sparks): prior four-Spark deployment recipe and comparison reference. Its NCCL tuning settings were not used for these measurements.
 

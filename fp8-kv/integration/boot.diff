@@ -1,0 +1,7 @@
+--- a/boot.sh
++++ b/boot.sh
+@@ -1,2 +1,4 @@
+ # Existing boot: base environment and topology remain unchanged.
++source "$RECIPE_DIR/fp8-kv/integration/boot.fragment.sh"
++REMOTE_ENV+=" $(fp8kv_remote_env)"
+ ssh "$target" "env $REMOTE_ENV bash $remote_launcher $rank"

@@ -47,8 +47,8 @@ class RecipeTests(unittest.TestCase):
             mock=base/'docker'
             mock.write_text('#!/usr/bin/env python3\nimport json,os,sys\nif sys.argv[1:3]==["container","inspect"]:sys.exit(1)\nwith open(os.environ["MOCK_LOG"],"a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")\nprint("mock-container")\n')
             mock.chmod(0o755)
-            env={**os.environ,'STEP5_CONFIG':'','STEP5_ROOT':str(storage),'CACHE_DIR':str(base/'cache'),'PATH':str(base)+os.pathsep+os.environ['PATH'],'MOCK_LOG':str(base/'calls'),'GMU':'0.85','BATCH_TOKENS':'4096','KV_DTYPE':'auto','STEP5_DENSE':'1','LMONLY':'1','SPEC_TOKENS':'3','DROP_PAGE_CACHE':'0'}
-            for key in ('MAXLEN','RDMA_HCA','NCCL_CROSS_NIC','NCCL_MIN_NCHANNELS','NCCL_MAX_NCHANNELS'):env.pop(key,None)
+            env={**os.environ,'STEP5_CONFIG':'','STEP5_ROOT':str(storage),'CACHE_DIR':str(base/'cache'),'PATH':str(base)+os.pathsep+os.environ['PATH'],'MOCK_LOG':str(base/'calls'),'GMU':'0.85','BATCH_TOKENS':'4096','KV_DTYPE':'auto','STEP5_DENSE':'1','LMONLY':'1','SPEC_TOKENS':'3','DROP_PAGE_CACHE':'0','STEP5_FP8KV':'0'}
+            for key in ('VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS','MAXLEN','RDMA_HCA','NCCL_CROSS_NIC','NCCL_MIN_NCHANNELS','NCCL_MAX_NCHANNELS'):env.pop(key,None)
             for rank in range(4):
                 p=shell('launch.sh',rank,env=env);self.assertEqual(p.returncode,0,p.stderr)
             calls=[json.loads(x) for x in (base/'calls').read_text().splitlines()]
@@ -56,6 +56,7 @@ class RecipeTests(unittest.TestCase):
             for rank,call in enumerate(calls):
                 for flag,value in [('--max-model-len','196608'),('--kv-cache-dtype','auto'),('--gpu-memory-utilization','0.85'),('--max-num-batched-tokens','4096'),('--tensor-parallel-size','4'),('--nnodes','4'),('--node-rank',str(rank))]:
                     self.assertEqual(call[call.index(flag)+1],value)
+                self.assertIn('VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1',call)
                 self.assertEqual('--headless' in call,rank!=0)
                 self.assertIn('--language-model-only',call)
                 for setting in ('NCCL_IB_HCA=mlx5_0,mlx5_1','NCCL_CROSS_NIC=1','NCCL_MIN_NCHANNELS=2','NCCL_MAX_NCHANNELS=2'):
@@ -70,9 +71,54 @@ class RecipeTests(unittest.TestCase):
             self.assertEqual(alternate[alternate.index('--max-model-len')+1],'65536')
             for setting in ('NCCL_IB_HCA=rail_a,rail_b','NCCL_CROSS_NIC=0','NCCL_MIN_NCHANNELS=4','NCCL_MAX_NCHANNELS=4'):
                 self.assertIn(setting,alternate)
-            for setting in ('MAXLEN=196608','RDMA_HCA=mlx5_0,mlx5_1','NCCL_CROSS_NIC=1','NCCL_MIN_NCHANNELS=2','NCCL_MAX_NCHANNELS=2'):
+            for setting in ('MAXLEN=589824','FP8KV_BLOCKS=40000','GMU=0.86','VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0','STEP5_FP8KV=1','KV_DTYPE=fp8_e4m3','RDMA_HCA=mlx5_0,mlx5_1','NCCL_CROSS_NIC=1','NCCL_MIN_NCHANNELS=2','NCCL_MAX_NCHANNELS=2'):
                 self.assertIn(setting,(REPO/'env.example').read_text().splitlines())
+            # Default and safer profiles: these are CPU command tests, not GPU fit proof.
+            env.update(STEP5_FP8KV='1',KV_DTYPE='fp8_e4m3',RDMA_HCA='rail_a,rail_b',
+                NCCL_CROSS_NIC='1',NCCL_MIN_NCHANNELS='2',NCCL_MAX_NCHANNELS='2')
+            env.pop('FP8KV_DIR',None)
+            for cap,blocks,gmu,estimate in [('442368','30000','0.85','1'),('589824','40000','0.86','0')]:
+                env.update(MAXLEN=cap,FP8KV_BLOCKS=blocks,GMU=gmu,
+                    VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=estimate)
+                for rank in range(4):
+                    p=shell('launch.sh',rank,env=env);self.assertEqual(p.returncode,0,p.stderr)
+                    fp8=json.loads((base/'calls').read_text().splitlines()[-1])
+                    for flag,value in [('--kv-cache-dtype','fp8_e4m3'),('--block-size','16'),
+                        ('--num-gpu-blocks-override',blocks),('--max-model-len',cap),
+                        ('--gpu-memory-utilization',gmu),('--spec-tokens','3'),
+                        ('--max-num-batched-tokens','4096'),('--max-num-seqs','8'),('--node-rank',str(rank))]:
+                        self.assertEqual(fp8[fp8.index(flag)+1],value)
+                    setting='VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS='+estimate
+                    self.assertIn(setting,fp8)
+                    self.assertEqual(fp8[fp8.index(setting)-1],'-e')
+                    self.assertLess(fp8.index(setting),fp8.index('--entrypoint'))
+                    self.assertIn('STEP5_FP8KV=1',fp8)
+                    self.assertIn('PYTHONPATH=/opt/step5-fp8kv',fp8)
+                    self.assertIn('NCCL_CROSS_NIC=1',fp8)
+                    self.assertIn('type=bind,source='+str(REPO/'fp8-kv/overlay')+',target=/opt/step5-fp8kv,readonly',fp8)
+            before=(base/'calls').read_text()
+            for field in ('MAXLEN','FP8KV_BLOCKS','GMU'):
+                missing={**env,field:''}
+                p=shell('launch.sh',0,env=missing);self.assertNotEqual(p.returncode,0)
+                self.assertEqual((base/'calls').read_text(),before)
+            env.update(STEP5_FP8KV='0',KV_DTYPE='auto',MAXLEN='262144',GMU='0.86',
+                VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS='1')
+            p=shell('launch.sh',0,env=env);self.assertEqual(p.returncode,0,p.stderr)
+            bf16=json.loads((base/'calls').read_text().splitlines()[-1])
+            self.assertEqual(bf16[bf16.index('--max-model-len')+1],'262144')
+            self.assertEqual(bf16[bf16.index('--gpu-memory-utilization')+1],'0.86')
+            self.assertIn('VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1',bf16)
+            self.assertNotIn('--num-gpu-blocks-override',bf16)
+            self.assertNotIn('STEP5_FP8KV=1',bf16)
             p=shell('launch.sh',4,env=env);self.assertNotEqual(p.returncode,0)
+    def test_default_profile_from_example(self):
+        keys=['MAXLEN','FP8KV_BLOCKS','GMU','VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS',
+              'STEP5_FP8KV','KV_DTYPE','SPEC_TOKENS','BATCH_TOKENS','MAXSEQ','STEP5_DENSE']
+        p=subprocess.run(['bash','-c','set -a; source "$1"; python3 -c "$2"','bash',
+            str(REPO/'env.example'),
+            'import os,json; print(json.dumps([os.environ[k] for k in '+repr(keys)+']))'],
+            capture_output=True,text=True,check=True)
+        self.assertEqual(json.loads(p.stdout),['589824','40000','0.86','0','1','fp8_e4m3','3','4096','8','1'])
     def test_page_cache_loop_dry_run(self):
         p=shell('drop-page-cache.sh','--dry-run')
         self.assertEqual(p.returncode,0,p.stderr)

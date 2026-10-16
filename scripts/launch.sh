@@ -3,6 +3,21 @@
 source "$(dirname -- "$0")/common.sh"
 R=${1:?Usage: launch.sh rank [extra vLLM arguments]}; shift
 rank_check "$R"
+STEP5_FP8KV=${STEP5_FP8KV:-1}
+if [[ $STEP5_FP8KV == 1 ]]; then
+  KV_DTYPE=${KV_DTYPE:-fp8_e4m3}
+  FP8KV_DIR=${FP8KV_DIR:-$RECIPE_DIR/fp8-kv/overlay}
+  : "${MAXLEN:?Set MAXLEN for the selected FP8 profile}"
+  : "${FP8KV_BLOCKS:?Set FP8KV_BLOCKS for the selected FP8 profile}"
+  : "${GMU:?Set GMU for the selected FP8 profile}"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-0}
+else
+  KV_DTYPE=${KV_DTYPE:-auto}
+  MAXLEN=${MAXLEN:-196608}
+  GMU=${GMU:-0.85}
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-1}
+fi
+source "$RECIPE_DIR/fp8-kv/integration/launch.fragment.sh"
 [[ -s $MODEL_DIR/config.json && -s $MODEL_DIR/model.safetensors.index.json ]] || {
   echo 'Model view is missing; complete storage setup first' >&2; exit 2;
 }
@@ -35,14 +50,16 @@ docker run -d --name "$NAME" --gpus all --ipc=host --network=host --shm-size 16g
   -e "VLLM_HOST_IP=${NODES[$R]}" "${RDMA_ARGS[@]}" \
   -e "NCCL_CROSS_NIC=${NCCL_CROSS_NIC:-1}" \
   -e "NCCL_MIN_NCHANNELS=${NCCL_MIN_NCHANNELS:-2}" -e "NCCL_MAX_NCHANNELS=${NCCL_MAX_NCHANNELS:-2}" \
+  -e "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=$VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" \
+  "${FP8KV_ARGS[@]}" \
   --entrypoint vllm "$IMAGE" serve "$MODEL_DIR" "${HEAD_ARGS[@]}" \
   --served-model-name step5 --host 0.0.0.0 --port "${API_PORT:-18000}" \
   --tensor-parallel-size 4 --nnodes 4 --node-rank "$R" --master-addr "$NODE0" --master-port "${MASTER_PORT:-29511}" \
   --distributed-executor-backend mp --disable-custom-all-reduce \
-  --max-model-len "${MAXLEN:-196608}" --max-num-batched-tokens "${BATCH_TOKENS:-4096}" --max-num-seqs "${MAXSEQ:-8}" \
-  --gpu-memory-utilization "${GMU:-0.85}" --enable-prefix-caching --kv-cache-dtype "${KV_DTYPE:-auto}" \
+  --max-model-len "$MAXLEN" --max-num-batched-tokens "${BATCH_TOKENS:-4096}" --max-num-seqs "${MAXSEQ:-8}" \
+  --gpu-memory-utilization "$GMU" --enable-prefix-caching --kv-cache-dtype "$KV_DTYPE" \
   --trust-remote-code "${SPEC_ARGS[@]}" \
-  --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5 "${DENSE_ARGS[@]}" "${LM_ARGS[@]}" "$@"
+  --reasoning-parser step5 --enable-auto-tool-choice --tool-call-parser step5 "${DENSE_ARGS[@]}" "${LM_ARGS[@]}" "${FP8KV_VLLM_ARGS[@]}" "$@"
 if [[ ${DROP_PAGE_CACHE:-1} == 1 ]]; then
   nohup "$RECIPE_DIR/scripts/drop-page-cache.sh" > "$CACHE_DIR/page-cache-drop.log" 2>&1 < /dev/null &
   echo "$!" > "$CACHE_DIR/page-cache-drop.pid"
